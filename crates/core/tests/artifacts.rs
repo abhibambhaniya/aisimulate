@@ -262,6 +262,61 @@ fn cache_events_advertise_reusable_prefixes_only_when_caching_is_enabled() {
 }
 
 #[test]
+fn canonical_replay_reproduces_unplanned_output_tokens_and_kv_hashes() {
+    let output_tokens = |artifacts: &ReplayArtifacts, request_index: usize| -> Vec<u32> {
+        let request_id = artifacts.requests[request_index].request_id;
+        artifacts
+            .outputs
+            .iter()
+            .filter(|output| output.request_id == request_id)
+            .filter_map(|output| output.token_id)
+            .collect()
+    };
+    for backend in [Backend::Vllm, Backend::Trtllm, Backend::Sglang] {
+        let run = || {
+            let mut replay_spec = spec(backend, 1, 1);
+            // Identical length-only requests carry no output plan, so every
+            // generated token and output-block hash is engine-synthesized.
+            replay_spec.requests = (0..2)
+                .map(|index| {
+                    let mut request =
+                        replay_request(&format!("unplanned-{index}"), 0.0, (0..6).collect());
+                    request.output_tokens = 9;
+                    request
+                })
+                .collect();
+            Replayer::new(replay_spec, ReplayEngineFactory::new())
+                .unwrap()
+                .with_capture_options(ReplayCaptureOptions {
+                    determinism: ReplayDeterminism::CanonicalV1,
+                    ..ReplayCaptureOptions::default()
+                })
+                .run_with_artifacts(ReplayArtifactKvEventVisibility::Native)
+                .unwrap()
+                .1
+        };
+        let first = run();
+        let second = run();
+        for request_index in 0..2 {
+            let tokens = output_tokens(&first, request_index);
+            assert_eq!(tokens.len(), 9, "{backend:?}");
+            assert_eq!(
+                tokens,
+                output_tokens(&second, request_index),
+                "{backend:?} request {request_index}"
+            );
+        }
+        assert_ne!(
+            output_tokens(&first, 0),
+            output_tokens(&first, 1),
+            "{backend:?}: distinct requests must not share synthetic output blocks"
+        );
+        assert!(!first.kv_events.is_empty(), "{backend:?}");
+        assert_eq!(kv_parts(&first), kv_parts(&second), "{backend:?}");
+    }
+}
+
+#[test]
 fn capped_passes_respect_visibility_boundaries() {
     let capped = |visibility| {
         let mut replay_spec = spec(Backend::Vllm, 1, 1);

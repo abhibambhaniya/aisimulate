@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serial
 
 from aisimulate.config.traffic import AgenticSnapshotOptions
 
-from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, SystemsPath, is_active_engine_model_control
+from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, SystemsPath, SystemsRoot, is_active_engine_model_control
 from ..config.engine import NgramSpeculationConfig
 
 
@@ -525,7 +525,7 @@ class SearchSpace(BaseModel):
     hardware_sku: str  # e.g. "h200_sxm"
     database_mode: Literal["SILICON", "HYBRID", "EMPIRICAL", "SOL"] = "SILICON"
     transfer_policy: str | list[str] | None = None
-    systems_paths: list[str] | None = Field(default=None, min_length=1)
+    systems_paths: list[SystemsRoot] | None = Field(default=None, min_length=1)
     systems_path: SystemsPath | None = Field(default=None, exclude=True)
     estimation_mode: Literal["auto", "op_level", "fpm_interpolation", "fpm_regression"] = "auto"
     fallback_policy: Literal["deny", "allow"] = "deny"
@@ -827,15 +827,6 @@ class SearchSpace(BaseModel):
     @classmethod
     def _normalize_estimator_database_mode(cls, value):
         return value.upper() if isinstance(value, str) else value
-
-    @field_validator("systems_paths")
-    @classmethod
-    def _validate_estimator_roots(cls, value):
-        if value is None:
-            return value
-        if any(not path.strip() for path in value):
-            raise ValueError("systems_paths entries must be nonempty")
-        return value
 
     @model_validator(mode="after")
     def _validate_estimator_controls(self):

@@ -16,6 +16,7 @@ from .common import (
     NumericRange,
     StrictModel,
     SystemsPath,
+    SystemsRoot,
     is_active_engine_model_control,
 )
 
@@ -217,7 +218,7 @@ class TimingConfig(StrictModel):
     estimation_mode: Literal["auto", "op_level", "fpm_interpolation", "fpm_regression"] | None = None
     fallback_policy: Literal["deny", "allow"] | None = None
     estimator_config: dict[str, Any] | None = None
-    systems_paths: list[str] | None = Field(default=None, min_length=1)
+    systems_paths: list[SystemsRoot] | None = Field(default=None, min_length=1)
     database_mode: Literal["SILICON", "HYBRID", "EMPIRICAL", "SOL"] | None = None
     transfer_policy: str | list[str] | None = None
 
@@ -352,7 +353,7 @@ class EstimatorPolicyConfig(StrictModel):
 
     database_mode: Literal["SILICON", "HYBRID", "EMPIRICAL", "SOL"] = "SILICON"
     transfer_policy: str | list[str] | None = None
-    systems_paths: list[str] | None = None
+    systems_paths: list[SystemsRoot] | None = Field(default=None, min_length=1)
     systems_path: SystemsPath | None = Field(default=None, exclude=True)
     estimation_mode: Literal["auto", "op_level", "fpm_interpolation", "fpm_regression"] = "auto"
     fallback_policy: Literal["deny", "allow"] = "deny"
@@ -370,15 +371,6 @@ class EstimatorPolicyConfig(StrictModel):
     @classmethod
     def _normalize_database_mode(cls, value):
         return value.upper() if isinstance(value, str) else value
-
-    @field_validator("systems_paths")
-    @classmethod
-    def _nonempty_system_roots(cls, value):
-        if value is None:
-            return value
-        if not value or any(not path.strip() for path in value):
-            raise ValueError("systems_paths must contain at least one nonempty root")
-        return value
 
     @model_validator(mode="after")
     def _supported_estimator_policies(self):

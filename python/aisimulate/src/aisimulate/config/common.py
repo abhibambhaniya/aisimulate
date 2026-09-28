@@ -27,6 +27,17 @@ def _absolute_systems_path(value: str) -> str:
 SystemsPath = Annotated[str, Field(strict=True, min_length=1), AfterValidator(_absolute_systems_path)]
 
 
+def _normalize_systems_root(value: str) -> str:
+    if not value.strip():
+        raise ValueError("systems_paths entries must be nonempty")
+    if value.lower() == "default":
+        return "default"
+    return str(Path(value).expanduser().resolve())
+
+
+SystemsRoot = Annotated[str, Field(strict=True, min_length=1), AfterValidator(_normalize_systems_root)]
+
+
 T = TypeVar("T")
 PositiveFiniteFloat = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 PositiveStrictInt = Annotated[int, Field(strict=True, gt=0)]

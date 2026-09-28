@@ -1346,11 +1346,11 @@ def _cell_generator_overrides(
         model_args.extend(
             [
                 "--worker-cls",
-                instrumentation.manifest["worker_class"]
+                "fpm_runtime_instrumentation.ObservedWorker"
                 if instrumentation is not None
                 else "fpm_memory_worker.FpmResourceWorker",
                 "--scheduler-cls",
-                instrumentation.manifest["scheduler_class"]
+                "fpm_runtime_instrumentation.ObservedInstrumentedScheduler"
                 if instrumentation is not None
                 else "fpm_memory_scheduler.FpmResourceInstrumentedScheduler",
             ]

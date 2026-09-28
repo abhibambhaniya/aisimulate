@@ -381,6 +381,10 @@ def observe(
             payload["unresolved_fields"].append(label)
             errors.append(f"{label}: {type(error).__name__}: {error}")
 
+    if "instrumentation_binding" in context:
+        from fpm_runtime_instrumentation import observed_binding
+
+        capture("instrumentation_binding", lambda: payload.update(instrumentation_binding=observed_binding()))
     capture("runtime", lambda: _runtime(payload, manifest, version))
     capture("model_config_sha256", lambda: _loaded_config(owner, payload))
     capture("resolved_config", lambda: payload.update(resolved_config=_resolved(owner)))

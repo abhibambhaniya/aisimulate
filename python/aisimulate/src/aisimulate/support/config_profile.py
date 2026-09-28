@@ -22,7 +22,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +133,7 @@ class ModelConfig:
     sha256: str
     suggestions: dict[str, Any]
     notes: dict[str, str]
+    source_files: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -419,12 +420,14 @@ def _validate_architecture(
 
 
 def load_model_config(path: str | Path) -> ModelConfig:
-    """Load a local JSON document, preserving its byte-level SHA-256 provenance."""
-    payload = Path(path).expanduser().read_bytes()
+    """Load local config/ModelOpt metadata with separate byte-level provenance."""
+    path = Path(path).expanduser().absolute()
+    payload = path.read_bytes()
     raw = json.loads(payload, object_pairs_hook=_unique_object, parse_float=_finite_float, parse_constant=_finite_float)
     if not isinstance(raw, dict):
         raise ValueError("model config JSON must be an object")
     document = raw
+    source_files = {}
     notes = {
         "modeling_scope": (
             "Text decoder only. FPM excludes multimodal encoders, projectors, preprocessing and other non-text "
@@ -444,17 +447,46 @@ def load_model_config(path: str | Path) -> ModelConfig:
         raw = dict(text_config)
         notes["decoder_config"] = "config text_config; outer model and encoder geometry are excluded"
         inherited = []
-        for keys in (("dtype", "torch_dtype"), ("quantization_config", "hf_quant_config", "quant_algo")):
+        for keys, inferred_keys in (
+            (("dtype", "torch_dtype"), ()),
+            (("quantization_config", "hf_quant_config", "quant_algo"), ("quant_dynamic", "kv_cache_quant_algo")),
+        ):
             if any(raw.get(key) is not None for key in keys):
                 continue
             for key in keys:
                 if document.get(key) is not None:
                     raw[key] = document[key]
                     inherited.append(key)
+            for key in inferred_keys:
+                if raw.get(key) is None and document.get(key) is not None:
+                    raw[key] = document[key]
+                    inherited.append(key)
         if inherited:
             notes["shared_metadata"] = (
                 f"config-level {', '.join(inherited)} inherited because text_config does not declare that metadata"
             )
+    sidecar_path = path.parent / "hf_quant_config.json"
+    if sidecar_path.is_file():
+        from aisimulate_core.sdk.fpm_model_metadata import attach_quantization_sidecar
+
+        sidecar_payload = sidecar_path.read_bytes()
+        sidecar = json.loads(
+            sidecar_payload, object_pairs_hook=_unique_object, parse_float=_finite_float, parse_constant=_finite_float
+        )
+        if not isinstance(sidecar, dict):
+            raise ValueError("hf_quant_config.json must be an object")
+        if document.get("hf_quant_config") is not None and document["hf_quant_config"] != sidecar:
+            raise ValueError("conflicting inline hf_quant_config and adjacent hf_quant_config.json")
+        source_files[sidecar_path.name] = hashlib.sha256(sidecar_payload).hexdigest()
+        notes["quantization_sidecar"] = (
+            f"local ModelOpt sidecar {sidecar_path} sha256={source_files[sidecar_path.name]}; "
+            "checkpoint quantization metadata; runtime attention precision remains independent"
+        )
+        _validate_quantization(raw)
+        merged = attach_quantization_sidecar(raw, sidecar)
+        if raw is document:
+            document = merged
+        raw = merged
     geometry = {key: _aliased_int(raw, key) for key in _INT_ALIASES}
     for key in _EXTRA_DIMENSIONS:
         if raw.get(key) is not None:
@@ -541,7 +573,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
     for key in ("num_nextn_predict_layers", "num_mtp_modules", "mtp_transformer_layers", "use_mtp"):
         if key in raw:
             notes[key] = f"config {key}={raw[key]}; checkpoint capability does not enable runtime speculative decoding"
-    return ModelConfig(raw, decoder_architecture, hashlib.sha256(payload).hexdigest(), suggestions, notes)
+    return ModelConfig(raw, decoder_architecture, hashlib.sha256(payload).hexdigest(), suggestions, notes, source_files)
 
 
 def validate_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -586,6 +618,50 @@ def validate_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
     raw = config.raw
+    if config.source_files:
+        from aisimulate_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+
+        inferred = {
+            key: raw[key] for key in ("quant_algo", "quant_dynamic", "kv_cache_quant_algo") if raw.get(key) is not None
+        }
+        result = {}
+        if inferred.get("quant_algo") in {
+            "fp8",
+            "fp8_block",
+            "nvfp4",
+            "mxfp4",
+            "mixed_precision",
+            "compressed-tensors",
+        }:
+            # Reuse collector weight classification, discarding its legacy
+            # attention/KV defaults: weight precision never establishes them.
+            modes = _infer_quant_modes_from_raw_config({**raw, "kv_cache_quant_algo": None})
+            result.update(
+                (
+                    key,
+                    (
+                        modes[key].name,
+                        "checkpoint/FPM weight identity from config and ModelOpt sidecar; "
+                        "tensor scales/exclusions require explicit weight bytes",
+                    ),
+                )
+                for key in ("gemm_quant_mode", "moe_quant_mode")
+                if key in modes
+            )
+        kv = inferred.get("kv_cache_quant_algo")
+        if kv in {"fp8", "bfloat16"}:
+            result["kv_cache_dtype"] = (
+                kv,
+                "explicit config/ModelOpt KV quantization metadata (independent of weight quantization)",
+            )
+        else:
+            scheme = _kv_cache_scheme(raw.get("quantization_config") or {})
+            if scheme.get("num_bits") == 8 and scheme.get("type") in {"float", "int"}:
+                result["kv_cache_dtype"] = (
+                    "fp8" if scheme["type"] == "float" else "int8",
+                    "explicit config quantization_config.kv_cache_scheme (independent of weight quantization)",
+                )
+        return result
     quant = raw.get("quantization_config")
     if quant is None and (raw.get("hf_quant_config") is not None or raw.get("quant_algo") is not None):
         return {}  # Unrecognized sidecar/processed metadata must not become unquantized defaults.
@@ -595,8 +671,8 @@ def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
                 ("gemm_quant_mode", "moe_quant_mode"),
                 (
                     "bfloat16",
-                    "assumption: bfloat16 tensor dtype with no inline quantization metadata; "
-                    "verify deployed weight precision (sidecars and checkpoint tensors are not inspected)",
+                    "assumption: bfloat16 tensor dtype with no inline or adjacent ModelOpt quantization metadata; "
+                    "verify deployed weight precision (checkpoint tensors are not inspected)",
                 ),
             )
         return {}
@@ -1134,6 +1210,7 @@ def derive_profile(
     provenance = json.dumps(
         {
             "config_sha256": config.sha256,
+            **({"config_source_files": config.source_files} if config.source_files else {}),
             "method": ("local config facts; byte estimates are planning evidence, not runtime limits or measurements"),
             "memory_source": "declared" if declared_memory else "pending",
             "planning_estimates": {
@@ -1231,6 +1308,7 @@ def profile_from_observations(
                 {
                     "method": "validated runtime resources with local model configuration metadata",
                     "config_sha256": config.sha256,
+                    **({"config_source_files": config.source_files} if config.source_files else {}),
                     "config_notes": config.notes,
                     "user_overrides": {
                         key: {"value": value, "source": "user assumption"} for key, value in supplied.items()

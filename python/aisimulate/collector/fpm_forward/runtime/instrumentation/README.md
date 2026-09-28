@@ -11,7 +11,7 @@ These are original AISimulate adapters written against inspected runtime interfa
 
 ## Runtime interface
 
-The existing collector stages the frozen bundle on `PYTHONPATH` and supplies these environment variables:
+The collector stages the frozen bundle and a collector-owned import entrypoint, and supplies these environment variables:
 
 | Variable | Contents |
 | --- | --- |
@@ -21,7 +21,9 @@ The existing collector stages the frozen bundle on `PYTHONPATH` and supplies the
 
 Worker and scheduler classes inherit the native vLLM worker and Dynamo `InstrumentedScheduler`. The worker preserves return values and exceptions from memory profiling, cache initialization and warm-up. The scheduler calls the native constructor first. Neither intercepts timed forwards, selects kernels, changes scheduler settings, or changes sampling. Python modules are imported only by those runtime processes; bundle preview/freezing and observation import do not import them.
 
-Both adapters export `ObservedInstrumentedScheduler`. The runner passes the manifest's `scheduler_class` unchanged to `--scheduler-cls`; both pinned Dynamo argument consumers require its string to contain `InstrumentedScheduler` before importing the class. Preserve this name constraint as well as native inheritance. Each version's source notes link the exact consumer.
+Both adapters export `ObservedInstrumentedScheduler`. The runner passes `fpm_runtime_instrumentation.ObservedInstrumentedScheduler` to `--scheduler-cls`; both pinned Dynamo argument consumers require its string to contain `InstrumentedScheduler` before importing the class. The entrypoint verifies the complete frozen bundle, including source notes, then imports only requested modules from their declared paths. It rejects modules previously loaded outside that verified import path. Its method-free subclass retains native inheritance and routes spawned-process unpickling through the same verification. Runtime dependencies outside the manifest keep normal Python import behavior; this is provenance checking, not a sandbox for campaign code.
+
+The entrypoint emits `runtime-instrumentation-imports-<hostname>-<pid>.json` with actual file hashes, loaded module paths, classes and failures. The separate built-in Slurm launcher CPU observer is outside this bundle and is not attributed to its hash. New contexts contain `instrumentation_binding` with the collector loader's hash. Every worker/scheduler observation for such a context must include `instrumentation_binding` returned by `from fpm_runtime_instrumentation import observed_binding`; call `observed_binding()` after the native lifecycle hook, never copy the context marker as observation. The bundled adapter does this automatically. The CPU importer checks observed imports against the frozen manifest and context without executing campaign code. Archived contexts without this marker remain readable with `import_binding: unverified_legacy`; they are not retroactively verified or rewritten.
 
 ## Observation meanings
 
@@ -29,7 +31,7 @@ Both adapters export `ObservedInstrumentedScheduler`. The runner passes the mani
 | --- | --- |
 | `runtime.version` | Installed `importlib.metadata.version("vllm")`, checked against both class version and manifest. |
 | `runtime.source_revision`, `runtime.source_files` | Pinned interpretation revision plus SHA-256 of actual installed files, including the Dynamo scheduler and inspected backends. All must match. A supplied generated vLLM commit ID is checked and retained separately in `source_identity`; file hashes do not attest the entire source tree. |
-| `launch`, `identity`, attempt/configuration/phase/bundle | Runner context copied verbatim. These declarations are independently checked against actual resolved configuration and hardware on import. |
+| `launch`, `identity`, attempt/configuration/phase/bundle | Runner context copied verbatim. These declarations are independently checked against actual resolved configuration and hardware on import. The separate `instrumentation_binding` records the verified runtime bundle bytes and modules actually imported. |
 | `resolved_config` | Actual initialized vLLM model/cache/scheduler/parallel/compilation/kernel/quantization/offload fields, including speculative and transfer configuration. No launch value substitutes for an unobserved field. |
 | `model_config_sha256`, `loaded_model_config` | SHA-256 of the actual `hf_config_path or model` directory's `config.json`, or the local HF cache's `config.json` at `hf_config._commit_hash`. No network request is made. Missing files, non-HF formats and version-selected alternative configuration files remain unresolved. The launch passes the reviewed `--revision` to native model construction, including for local directories. Import requires the observed revision and independently checks the loaded config bytes; this binds configuration and the declared source revision, not weight bytes. |
 | `model_config_source_files` | When the launch declares adjacent model-config sidecars, SHA-256 values are read from the actual config directory. Missing files remain unresolved; expected hashes are never echoed. The primary config bytes remain unchanged. |

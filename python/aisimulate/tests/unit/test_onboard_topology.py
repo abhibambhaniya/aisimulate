@@ -446,8 +446,16 @@ def test_selected_topology_survives_late_identity_correction(monkeypatch, tmp_pa
     assert request.identity.framework_version == _OPTIONS["framework_version"]
 
 
-def test_cold_supervised_preview_does_not_import_execution_or_model_code(tmp_path):
+@pytest.mark.parametrize("nested", [False, True])
+def test_cold_supervised_preview_does_not_import_execution_or_model_code(tmp_path, nested):
     source, resources = _inputs(tmp_path)
+    if nested:
+        raw = json.loads(source.read_text())
+        source.write_text(
+            json.dumps(
+                {"_name_or_path": raw.pop("_name_or_path"), "torch_dtype": raw.pop("torch_dtype"), "text_config": raw}
+            )
+        )
     output = tmp_path / "new" / "request.yaml"
     command = _args(source, resources, output) + ["--suggest-parallel"]
     script = """

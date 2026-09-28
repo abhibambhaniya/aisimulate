@@ -420,6 +420,68 @@ def test_runtime_records_import_complete_for_source_audited_layouts(tmp_path, mo
     assert result["status"] == "complete", result["diagnostics"]
 
 
+def test_bundled_lifecycle_through_verified_entrypoint_imports_both_phases(tmp_path, monkeypatch):
+    import importlib
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    from collector.fpm_forward.runtime_instrumentation import runtime_binding
+    from collector.fpm_forward.runtime_observations import validate_observations
+    from collector.fpm_forward.runtime_probe import observation_artifacts
+
+    campaign = _fake_campaign(tmp_path, monkeypatch, version="0.27.0")
+    frozen = load_instrumentation(tmp_path / "instrumentation/manifest.json")
+    runtime = Path(__file__).parents[3] / "collector/fpm_forward/runtime"
+    monkeypatch.syspath_prepend(str(runtime))
+    for phase in ("prefill", "decode"):
+        # Each native phase is a fresh process. Retain the fixture's fake runtime
+        # dependencies while clearing only adapters before invoking the entrypoint.
+        for name in list(sys.modules):
+            if name in {"fpm_memory_observer", "fpm_runtime_instrumentation", "instrumentation"} or name.startswith(
+                "instrumentation."
+            ):
+                monkeypatch.delitem(sys.modules, name)
+        original_adapter = campaign.adapter
+        entrypoint = importlib.import_module("fpm_runtime_instrumentation")
+
+        def worker():
+            context_path = Path(os.environ["AISIMULATE_RUNTIME_CONTEXT"])
+            context = json.loads(context_path.read_text())
+            context["instrumentation_binding"] = runtime_binding()
+            context_path.write_text(json.dumps(context))
+            return entrypoint.ObservedWorker()
+
+        # The fixture closes over its adapter module, so redirect those two
+        # exports to the runtime entrypoint rather than bypassing native hooks.
+        monkeypatch.setattr(original_adapter, "ObservedWorker", worker)
+        monkeypatch.setattr(
+            original_adapter,
+            "ObservedInstrumentedScheduler",
+            lambda *args: entrypoint.ObservedInstrumentedScheduler(*args),
+        )
+        try:
+            records = campaign.run(phase)
+            assert all(record["instrumentation_binding"]["status"] == "verified" for record in records)
+            assert all(record["instrumentation_binding"]["files"] == frozen.files for record in records)
+            assert issubclass(entrypoint.ObservedWorker, campaign.base)
+            # Probe and formal collection use this same artifact enumerator.
+            references = observation_artifacts(tmp_path, tmp_path / phase)
+            assert any("runtime-instrumentation-imports-" in item["path"] for item in references)
+            index_path = tmp_path / "observations.json"
+            index = json.loads(index_path.read_text())
+            index["configurations"]["worker"]["attempts"][0]["phases"][phase]["artifacts"] = references
+            index_path.write_text(json.dumps(index))
+        finally:
+            if entrypoint._bundle is not None:
+                sys.meta_path.remove(entrypoint._bundle)
+            monkeypatch.delitem(sys.modules, "fpm_runtime_instrumentation")
+    result = validate_observations(tmp_path / "observations.json", {"worker": campaign.launch})["worker"]
+    assert result["status"] == "complete", result
+    assert result["provenance"]["instrumentation"]["import_binding"] == "verified"
+
+
 @pytest.mark.parametrize("version", ["0.27.0", "0.28.0"])
 @pytest.mark.parametrize("runner_version", [1, 2])
 def test_native_runner_selection_uses_its_initialized_kernel_block_sizes(

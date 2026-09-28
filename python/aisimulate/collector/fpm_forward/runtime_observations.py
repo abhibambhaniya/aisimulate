@@ -304,6 +304,64 @@ def _validate_record(
     return config
 
 
+def _validate_import_binding(record: dict, expected: dict, bundle: InstrumentationBundle) -> None:
+    """Recheck actual runtime imports without importing any campaign code."""
+    evidence = record.get("instrumentation_binding")
+    if not isinstance(evidence, dict) or evidence.get("status") != "verified" or evidence.get("error"):
+        raise ValueError("runtime observation lacks verified instrumentation imports")
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != {"schema_version", "loader_sha256"}
+        or expected.get("schema_version") != "aisimulate-runtime-instrumentation-imports/v1"
+    ):
+        raise ValueError("unsupported runtime instrumentation import binding")
+    validate_sha256(expected.get("loader_sha256"), "runtime instrumentation loader")
+    for name, value in expected.items():
+        _same(evidence.get(name), value, f"instrumentation import {name}")
+    for name in ("attempt_id", "configuration", "phase", "bundle_sha256"):
+        _same(evidence.get(name), record.get(name), f"instrumentation import {name}")
+    _same(evidence.get("expected_bundle_sha256"), bundle.sha256, "instrumentation expected bundle")
+    _same(evidence.get("files"), bundle.files, "runtime instrumentation file hashes")
+    _positive(evidence.get("pid"), "instrumentation import process ID")
+    _text(evidence.get("hostname"), "instrumentation import hostname")
+    cpu = record.get("cpu_affinity_observation")
+    if isinstance(cpu, dict):
+        for name in ("pid", "hostname"):
+            if cpu.get(name) is not None:
+                _same(evidence[name], cpu[name], f"instrumentation import process {name}")
+    root = PurePosixPath(_text(evidence.get("root"), "runtime instrumentation root"))
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("runtime instrumentation root must be an absolute normalized path")
+    imports = evidence.get("imports")
+    if not isinstance(imports, dict) or not imports:
+        raise ValueError("runtime instrumentation import evidence is empty")
+    for module, imported in imports.items():
+        if not isinstance(module, str) or not isinstance(imported, dict):
+            raise ValueError("runtime instrumentation module evidence must be an object")
+        filename = imported.get("file")
+        if (
+            not isinstance(filename, str)
+            or filename not in bundle.files
+            or filename
+            not in (
+                module.replace(".", "/") + ".py",
+                module.replace(".", "/") + "/__init__.py",
+            )
+        ):
+            raise ValueError("runtime instrumentation module is not a declared bundle source")
+        _same(imported.get("sha256"), bundle.files[filename], "imported instrumentation source")
+        path = PurePosixPath(_text(imported.get("path"), "imported instrumentation path"))
+        if path != root / filename:
+            raise ValueError("runtime instrumentation module origin contradicts its declared source")
+    field = "worker_class" if record["kind"] == "worker" else "scheduler_class"
+    classes = evidence.get("classes")
+    if not isinstance(classes, dict):
+        raise ValueError("runtime instrumentation classes must be an object")
+    _same(classes.get(field), bundle.manifest[field], "imported instrumentation class")
+    if bundle.manifest[field].rsplit(".", 1)[0] not in imports:
+        raise ValueError("runtime instrumentation class module was not observed")
+
+
 def _validate_alias_ownership(views: list[tuple[dict[str, Any], int]], count: int) -> None:
     """Prove disjoint pool-block ownership for the union of aliased views."""
     ownership, block_span = None, 0
@@ -373,7 +431,12 @@ def _physical_views(
             or group.get("attention_chunk_size") is not None
         ):
             raise ValueError("unsupported or unresolved extra/chunk cache retention")
-        if runtime_memory._dtype(group.get("dtype")) != precision:
+        storage_dtype = runtime_memory._dtype(group.get("dtype"))
+        # vLLM 4bdc8a788d2e2ce9165d552b3d4d8b72604626bf
+        # utils/torch_utils.py:STR_DTYPE_TO_TORCH_DTYPE stores FP8 as uint8,
+        # also used by other packed formats. Only the independently validated
+        # resolved cache precision establishes FP8; retain raw storage evidence.
+        if storage_dtype != precision and not (storage_dtype == "torch.uint8" and precision == "fp8"):
             raise ValueError("cache group dtype contradicts requested KV precision")
         _positive(group.get("spec_page_size_bytes"), "cache spec page bytes")
         for name in group["layer_names"]:
@@ -477,7 +540,8 @@ def _physical_views(
                 )
                 if within_page > group["spec_page_size_bytes"]:
                     raise ValueError("packed tensor exceeds its declared per-slot page interval")
-            if runtime_memory._dtype(group["dtype"]) in {"bfloat16", "half"} and item_size != 2:
+            expected_item_size = {"bfloat16": 2, "half": 2, "fp8": 1}.get(precision)
+            if expected_item_size is not None and item_size != expected_item_size:
                 raise ValueError("tensor element size contradicts cache dtype")
             views.append((view, ratio))
         _validate_alias_ownership(views, count)
@@ -510,7 +574,7 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
     if set(phases) != {"prefill", "decode"}:
         raise ValueError("runtime evidence requires both prefill and decode phases")
     canonical_settings, canonical_geometry, canonical_hardware, normalized = None, None, None, None
-    capacities, artifacts, launch_artifacts, runtime_artifacts = [], [], [], []
+    capacities, artifacts, launch_artifacts, runtime_artifacts, import_bindings = [], [], [], [], []
     used_paths: set[str] = set()
     for phase in ("prefill", "decode"):
         result = phases[phase]
@@ -522,6 +586,8 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
         for name, value in {**binding, "launch": launch, "expected_ranks": ranks}.items():
             _same(context.get(name), value, f"launch manifest {name}")
         launch_artifacts.append({**result["launch_manifest"], "sha256": digest})
+        import_binding = context.get("instrumentation_binding")
+        import_bindings.append(import_binding is not None)
         workers, schedulers = {}, {}
         cell = _launch_cell(launch, phase)
         references = result.get("artifacts")
@@ -537,6 +603,10 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
                 continue
             record = read_json(path)
             config = _validate_record(record, launch=launch, bundle=bundle, binding=binding, cell=cell)
+            if import_binding is not None:
+                _validate_import_binding(record, import_binding, bundle)
+            elif "instrumentation_binding" in record:
+                raise ValueError("observed instrumentation imports lack their frozen launch binding")
             dp = record.get("dp_rank")
             if type(dp) is not int or not 0 <= dp < cell.topology.dp:
                 raise ValueError("invalid observed DP rank")
@@ -573,7 +643,9 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
         for (dp, tp), worker in sorted(workers.items()):
             scheduler = schedulers[dp]
             runtime_memory._validate_scheduler_config(worker, scheduler)
-            groups, accounting = _physical_views(worker["cache"], scheduler["cache"], cell.kv_cache_dtype)
+            groups, accounting = _physical_views(
+                worker["cache"], scheduler["cache"], runtime_memory._resolved_cache_dtype(worker["resolved_config"])
+            )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
             ]
@@ -604,7 +676,11 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
         "launch_artifacts": launch_artifacts,
         "artifacts": artifacts,
         "runtime_artifacts": runtime_artifacts,
-        "instrumentation": {"manifest": str(bundle_path.relative_to(root)), "files": bundle.files},
+        "instrumentation": {
+            "manifest": str(bundle_path.relative_to(root)),
+            "files": bundle.files,
+            "import_binding": "verified" if all(import_bindings) else "unverified_legacy",
+        },
         "scope": "Physical memory of every loaded worker component. The loaded model configuration hash "
         "does not attest weight file contents. Source and synthetic checks alone do not establish "
         "live runtime qualification.",

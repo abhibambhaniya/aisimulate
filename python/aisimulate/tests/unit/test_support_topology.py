@@ -576,8 +576,13 @@ def test_input_provenance_is_preserved_and_serialization_excludes_profile_object
     assert "user override" in serialized["default"]["field_sources"]["provenance"]
 
 
-def test_cold_process_suggestions_do_not_import_native_runtime_models_or_timing_readers(tmp_path):
+@pytest.mark.parametrize("nested", [False, True])
+def test_cold_process_suggestions_do_not_import_native_runtime_models_or_timing_readers(tmp_path, nested):
     _config(tmp_path)
+    if nested:
+        path = tmp_path / "config.json"
+        raw = json.loads(path.read_text())
+        path.write_text(json.dumps({"torch_dtype": raw.pop("torch_dtype"), "text_config": raw}))
     code = """
 import builtins, importlib.abc, json, sys
 forbidden = ('aiconfigurator', 'aiconfigurator_core', 'aisimulate.sdk', 'aisimulate_core.sdk',

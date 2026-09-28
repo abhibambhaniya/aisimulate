@@ -66,10 +66,11 @@ def _write(path, payload):
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def observation_fixture(root: Path, *, packed=False, planar=False, dense=False, tp=2):
+def observation_fixture(root: Path, *, packed=False, planar=False, dense=False, tp=2, version="0.28.0"):
     """Synthetic source, rank and runtime records; no GPU or runtime qualification."""
     root.mkdir(parents=True, exist_ok=True)
     path, manifest = _manifest(root)
+    manifest["runtime"]["version"] = version
     manifest["runtime"]["source_files"] = {"vllm/v1/core/block_pool.py": "b" * 64}
     path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(path)
@@ -81,7 +82,7 @@ def observation_fixture(root: Path, *, packed=False, planar=False, dense=False, 
             "model_revision": "immutable",
             "model_kind": "dense" if dense else "moe",
             "framework": "vllm",
-            "framework_version": "0.28.0",
+            "framework_version": version,
             "gpu": "gb300",
             "interconnect": "nvlink",
             "sm": 103,

@@ -18,6 +18,15 @@ import yaml
 
 INSTRUMENTATION_SCHEMA = "aisimulate-runtime-instrumentation/v1"
 OBSERVATION_SCHEMA = "aisimulate-runtime-observation/v1"
+INSTRUMENTATION_LOADER = "fpm_runtime_instrumentation.py"
+
+
+def runtime_binding() -> dict[str, str]:
+    """Identify the collector loader without importing runtime or adapter code."""
+    return {
+        "schema_version": "aisimulate-runtime-instrumentation-imports/v1",
+        "loader_sha256": sha256_bytes((Path(__file__).parent / "runtime" / INSTRUMENTATION_LOADER).read_bytes()),
+    }
 
 
 def canonical_json(value: Any) -> str:
@@ -155,6 +164,8 @@ def load_instrumentation(path: str | Path, expected_version: str | None = None) 
     if len({name.casefold() for name in names}) != len(names) or "manifest.json" in names:
         raise ValueError("instrumentation file paths must be unique and cannot use reserved manifest.json")
     files = {name: sha256_bytes(contained_file(path.parent, name).read_bytes()) for name in names}
+    if INSTRUMENTATION_LOADER in files or any(name.startswith("fpm_runtime_instrumentation/") for name in files):
+        raise ValueError("instrumentation cannot replace the collector's runtime loader")
     modules: dict[str, str] = {}
     for name in names:
         if not name.endswith(".py"):

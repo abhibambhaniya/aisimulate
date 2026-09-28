@@ -206,6 +206,13 @@ def _dtype(value: Any) -> str:
     }.get(value, value)
 
 
+def _resolved_cache_dtype(config: dict[str, Any]) -> str:
+    value = config["cache_config"].get("cache_dtype")
+    if value == "auto":
+        value = config["model_config"].get("dtype")
+    return _dtype(value)
+
+
 def _validate_precision(config: dict[str, Any], cell: FPMCell) -> None:
     """Check audited quantization families without assigning every layer a dtype.
 
@@ -390,11 +397,7 @@ def _validate_config(
         and (config.get("kernel_config") or {}).get("moe_backend") != expected_backend
     ):
         raise ValueError("runtime memory MoE backend differs from the planned identity")
-    cache = config["cache_config"]
-    actual_dtype = cache.get("cache_dtype")
-    if actual_dtype == "auto":
-        actual_dtype = config["model_config"].get("dtype")
-    if _dtype(actual_dtype) != cell.kv_cache_dtype:
+    if _resolved_cache_dtype(config) != cell.kv_cache_dtype:
         raise ValueError("runtime memory KV precision differs from the planned identity")
     _validate_precision(config, cell)
     _validate_no_offload(payload, config)

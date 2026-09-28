@@ -451,9 +451,12 @@ def record_collection_observations(
         raise ValueError("formal collection frozen observation identity mismatch")
 
     def verify_context(path: Path) -> None:
-        expected = launch_context(plan, cell, configuration=configuration, attempt_id=parent_attempt_id)
+        saved = read_json(path)
+        expected = launch_context(
+            plan, cell, configuration=configuration, attempt_id=parent_attempt_id, saved_context=saved
+        )
         expected.update(collector_attempt_id=cell_attempt_id, cell_id=cell.cell_id)
-        if read_json(path) != expected:
+        if saved != expected:
             raise ValueError("formal collection saved runtime context does not match its attempt")
 
     history = attempt["phase_attempts"].setdefault(cell.workload_kind, [])
@@ -517,14 +520,19 @@ def record_collection_observations(
     return index_path
 
 
-def launch_context(plan, cell: FPMCell, *, configuration: str, attempt_id: str) -> dict[str, Any]:
+def launch_context(
+    plan, cell: FPMCell, *, configuration: str, attempt_id: str, saved_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    from .runtime_instrumentation import runtime_binding
+
     topology = cell.topology
-    return {
+    context = {
         "schema_version": LAUNCH_SCHEMA,
         "configuration": configuration,
         "attempt_id": attempt_id,
         "phase": cell.workload_kind,
         "bundle_sha256": plan.runtime_instrumentation.sha256,
+        "instrumentation_binding": runtime_binding(),
         "launch": plan.runtime_launch,
         "sampling": getattr(plan, "probe_sampling", None),
         "expected_ranks": {
@@ -537,11 +545,23 @@ def launch_context(plan, cell: FPMCell, *, configuration: str, attempt_id: str) 
             "schedulers": [{"dp_rank": dp} for dp in range(topology.dp)],
         },
     }
+    if saved_context is not None:
+        # Recovery compares the archived attempt's identity. A loader upgrade
+        # does not invalidate its ownership or authorize relabeling old imports.
+        if "instrumentation_binding" in saved_context:
+            context["instrumentation_binding"] = saved_context["instrumentation_binding"]
+        else:
+            context.pop("instrumentation_binding")
+    return context
 
 
 def stage_runtime_instrumentation(bundle, cell_dir: Path, context: dict[str, Any]) -> list[Path]:
     """Package data without importing it; activation occurs only in the worker."""
 
+    from .runtime_instrumentation import INSTRUMENTATION_LOADER, runtime_binding
+
+    if context.get("instrumentation_binding") != runtime_binding():
+        raise ValueError("runtime instrumentation requires the current verified loader binding")
     for name, payload in _model_config_bytes(context["launch"]["model_config"]).items():
         (cell_dir / name).write_bytes(payload)
     archive = cell_dir / BUNDLE_FILENAME
@@ -571,11 +591,11 @@ with zipfile.ZipFile(archive) as bundle:
             raise RuntimeError('unsafe runtime instrumentation path')
     bundle.extractall(root)
 AISIMULATE_INSTRUMENTATION
-export PYTHONPATH="/tmp/fpm-bench/runtime-instrumentation${{PYTHONPATH:+:${{PYTHONPATH}}}}"
+export PYTHONPATH="/tmp/fpm-bench/runtime-instrumentation:/tmp/fpm-bench${{PYTHONPATH:+:${{PYTHONPATH}}}}"
 """
     with (cell_dir / runner.RUNTIME_ENV_FILENAME).open("a") as handle:
         handle.write(setup)
-    return [archive, context_path]
+    return [archive, context_path, Path(__file__).parent / "runtime" / INSTRUMENTATION_LOADER]
 
 
 def observation_artifacts(root: Path, phase_dir: Path) -> list[dict[str, Any]]:
@@ -745,8 +765,11 @@ def _cleanup_previous_attempt(root: Path, plan, attempt: dict[str, Any]) -> None
         phase_dir = directory / cell.workload_kind
         if context_path != phase_dir / CONTEXT_FILENAME:
             raise ValueError("saved runtime launch path does not belong to this attempt/phase")
-        expected = launch_context(previous_plan, cell, configuration=plan.configuration, attempt_id=attempt_id)
-        if read_json(context_path) != expected:
+        saved = read_json(context_path)
+        expected = launch_context(
+            previous_plan, cell, configuration=plan.configuration, attempt_id=attempt_id, saved_context=saved
+        )
+        if saved != expected:
             raise ValueError("saved runtime launch context does not match its attempt identity")
         resource_reference = phase.get("resource_manifest")
         if not isinstance(resource_reference, dict):

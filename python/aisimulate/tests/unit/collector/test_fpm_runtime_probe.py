@@ -164,7 +164,7 @@ def test_preview_requires_no_cache_geometry_and_never_imports_bundle(tmp_path, m
         assert params["params"]["agg"]["kv_cache_free_gpu_memory_fraction"] == 0.85
         assert args[args.index("--revision") + 1] == launch["identity"]["model_revision"]
         assert args.count("--revision") == 1
-        assert args[args.index("--worker-cls") + 1] == "observer.ObservedWorker"
+        assert args[args.index("--worker-cls") + 1] == "fpm_runtime_instrumentation.ObservedWorker"
         assert "--no-async-scheduling" in args
         batch_flag = "--prefix-max-batch-size-samples" if phase == "prefill" else "--decode-max-batch-size-samples"
         context = json.loads((tmp_path / "probe" / info["launch_manifest"]["path"]).read_text())
@@ -855,8 +855,9 @@ def test_probe_resume_rejects_changed_ownership_before_external_commands(tmp_pat
         ("slurm", False, "dep8"),
     ],
 )
+@pytest.mark.parametrize("saved_binding", ["current", "legacy", "older-loader"])
 def test_probe_resume_preserves_valid_interrupted_recovery(
-    tmp_path, monkeypatch, executor, changed_bundle, configuration
+    tmp_path, monkeypatch, executor, changed_bundle, configuration, saved_binding
 ):
     from collector.fpm_forward import runner, runtime_probe
 
@@ -885,7 +886,19 @@ def test_probe_resume_preserves_valid_interrupted_recovery(
     output = tmp_path / "probe"
     with pytest.raises(KeyboardInterrupt):
         runtime_probe.probe_runtime({configuration: launch}, instrumentation=manifest, output_dir=output, execute=True)
-    previous = json.loads((output / "observations.json").read_text())["configurations"][configuration]["attempts"][0]
+    index_path = output / "observations.json"
+    index = json.loads(index_path.read_text())
+    previous = index["configurations"][configuration]["attempts"][0]
+    reference = previous["phases"]["prefill"]["launch_manifest"]
+    saved_path = output / reference["path"]
+    context = json.loads(saved_path.read_text())
+    if saved_binding == "legacy":
+        context.pop("instrumentation_binding")
+    elif saved_binding == "older-loader":
+        context["instrumentation_binding"]["loader_sha256"] = "f" * 64
+    saved_path.write_text(json.dumps(context))
+    reference.update(runner._file_metadata(saved_path))
+    index_path.write_text(json.dumps(index))
     interrupted_dir = str((output / previous["phases"]["prefill"]["launch_manifest"]["path"]).parent)
     if changed_bundle:
         (tmp_path / "observer.py").write_text("# a revised observer retained alongside the interrupted bundle\n")
@@ -900,6 +913,10 @@ def test_probe_resume_preserves_valid_interrupted_recovery(
     previous = attempts[0]
     assert any(item["kind"] == "observation" for item in previous["phases"]["prefill"]["recovery_artifacts"])
     for phase in attempts[-1]["phases"].values():
+        from collector.fpm_forward.runtime_instrumentation import runtime_binding
+
+        new_context = json.loads((output / phase["launch_manifest"]["path"]).read_text())
+        assert new_context["instrumentation_binding"] == runtime_binding()
         observations = [item for item in phase["artifacts"] if item["kind"] == "observation"]
         assert len(observations) == (1 if configuration == "tp4" else 2)
 

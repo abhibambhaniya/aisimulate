@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from aisimulate.config.common import StrictModel, load_yaml
 
@@ -29,9 +29,12 @@ Ratio = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
 
 
 class RepeatabilityPolicy(StrictModel):
+    comparison_mode: Literal["full_grid", "bounded"] = "full_grid"
     samples: int = Field(default=5, strict=True, ge=2)
     max_points_per_cell: int = Field(default=12, strict=True, ge=1)
+    max_attempts_per_sample: int = Field(default=2, strict=True, ge=1)
     max_cv: Ratio = 0.05
+    max_source_relative_difference: Ratio = 0.05
 
 
 class InterpolationPolicy(StrictModel):
@@ -49,10 +52,24 @@ class ServingPolicy(StrictModel):
 
 
 class ValidationPolicy(StrictModel):
-    schema_version: Literal["aisimulate-onboarding-validation-policy/v1"] = "aisimulate-onboarding-validation-policy/v1"
+    schema_version: Literal[
+        "aisimulate-onboarding-validation-policy/v1", "aisimulate-onboarding-validation-policy/v2"
+    ] = "aisimulate-onboarding-validation-policy/v2"
     repeatability: RepeatabilityPolicy = Field(default_factory=RepeatabilityPolicy)
     interpolation: InterpolationPolicy = Field(default_factory=InterpolationPolicy)
     serving: ServingPolicy = Field(default_factory=ServingPolicy)
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_legacy_subset_policy(cls, values: Any) -> Any:
+        """Reading a saved v1 campaign must not turn its subset into a full sweep."""
+        if isinstance(values, dict) and values.get("schema_version") == "aisimulate-onboarding-validation-policy/v1":
+            repeatability = values.get("repeatability", {})
+            if isinstance(repeatability, dict):
+                if repeatability.get("comparison_mode", "bounded") != "bounded":
+                    raise ValueError("legacy v1 policy uses bounded repeats; choose v2 in a fresh campaign")
+                values = {**values, "repeatability": {**repeatability, "comparison_mode": "bounded"}}
+        return values
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -297,6 +314,9 @@ def _repeat_plan(plan: Any, campaign: Path, checkpoint: Path, policy: Validation
         samples=policy.repeatability.samples,
         max_points_per_cell=policy.repeatability.max_points_per_cell,
         cv_threshold=policy.repeatability.max_cv,
+        comparison_mode=policy.repeatability.comparison_mode,
+        max_attempts_per_sample=policy.repeatability.max_attempts_per_sample,
+        source_agreement_threshold=policy.repeatability.max_source_relative_difference,
     )
 
 
@@ -309,9 +329,37 @@ def _assess_repeats(directory: Path, policy: ValidationPolicy, expected_plan: di
         != {key: value for key, value in expected_plan.items() if key not in {"policy", "sha256"}}
         or frozen["policy"]["samples"] != policy.repeatability.samples
         or frozen["policy"]["max_points_per_cell"] != policy.repeatability.max_points_per_cell
+        or frozen["policy"].get("comparison_mode", "bounded") != policy.repeatability.comparison_mode
+        or frozen["policy"].get("max_attempts_per_sample") != policy.repeatability.max_attempts_per_sample
     ):
         raise ValueError("repeatability measurements do not match the source or selected sample policy")
-    return assess_repeatability(frozen, _json(directory / REPORT_FILENAME), cv_threshold=policy.repeatability.max_cv)
+    return assess_repeatability(
+        frozen,
+        _json(directory / REPORT_FILENAME),
+        cv_threshold=policy.repeatability.max_cv,
+        source_agreement_threshold=policy.repeatability.max_source_relative_difference,
+    )
+
+
+def _repeatability_gate_status(assessment: dict[str, Any], policy: ValidationPolicy) -> str:
+    """Fresh stable runs alone cannot qualify the original published source."""
+    if (
+        assessment.get("status") == "failed"
+        or assessment.get("source_qualification", {}).get("status") == "failed"
+        or assessment.get("new_population", {}).get("status") in {"failed", "unstable"}
+    ):
+        return "failed"
+    if (
+        policy.schema_version == "aisimulate-onboarding-validation-policy/v2"
+        and policy.repeatability.comparison_mode == "full_grid"
+        and assessment.get("schema_version") == 2
+        and assessment.get("policy", {}).get("comparison_mode") == "full_grid"
+        and assessment.get("source_qualification", {}).get("status") == "qualified"
+        and assessment.get("new_population", {}).get("status") == "qualified"
+        and assessment.get("status") == "passed"
+    ):
+        return "passed"
+    return "incomplete"
 
 
 def validate_collection(args: argparse.Namespace) -> int:
@@ -365,7 +413,7 @@ def validate_collection(args: argparse.Namespace) -> int:
                 "status": _execution_status(frozen),
                 "cells": [{"cell_id": c["cell_id"], **c["execution"]} for c in frozen["cells"]],
             },
-            "repeatability": {"status": "incomplete", "issues": ["bounded GPU repeats have not completed"]},
+            "repeatability": {"status": "incomplete", "issues": ["comparable GPU repeats have not completed"]},
             "interpolation": {"status": "incomplete"},
         },
     }
@@ -398,12 +446,15 @@ def validate_collection(args: argparse.Namespace) -> int:
             samples=policy.repeatability.samples,
             max_points_per_cell=policy.repeatability.max_points_per_cell,
             cv_threshold=policy.repeatability.max_cv,
+            comparison_mode=policy.repeatability.comparison_mode,
+            max_attempts_per_sample=policy.repeatability.max_attempts_per_sample,
+            source_agreement_threshold=policy.repeatability.max_source_relative_difference,
         )
     if repeats.exists():
         assessment = _assess_repeats(repeats, policy, frozen)
         _write(output / "repeatability-assessment.json", assessment)
         report["gates"]["repeatability"] = {
-            "status": assessment["status"],
+            "status": _repeatability_gate_status(assessment, policy),
             "directory": str(repeats),
             "assessment": _identity(output / "repeatability-assessment.json"),
         }
@@ -470,7 +521,9 @@ def check_collection_report(
     repeat = gates["repeatability"]
     if "directory" in repeat:
         assessment = _assess_repeats(Path(repeat["directory"]), policy, frozen)
-        if _json(_checked(repeat["assessment"])) != assessment or repeat["status"] != assessment["status"]:
+        if _json(_checked(repeat["assessment"])) != assessment or repeat["status"] != _repeatability_gate_status(
+            assessment, policy
+        ):
             raise ValueError("saved repeatability gate differs from raw samples")
     elif repeat["status"] != "incomplete":
         raise ValueError("repeatability gate has no measurement evidence")
@@ -762,7 +815,7 @@ def add_quality_parsers(actions: Any) -> None:
     collection.add_argument(
         "--execute",
         action="store_true",
-        help="Launch the frozen bounded repeatability subset using the original collector deployment.",
+        help="Launch frozen full-grid repeats, or bounded diagnostics, using the original collector deployment.",
     )
     collection.add_argument(
         "--resume",
@@ -772,11 +825,11 @@ def add_quality_parsers(actions: Any) -> None:
     collection.add_argument(
         "--retry-failed",
         action="store_true",
-        help="Retry failed repeat measurements in fresh attempt directories; requires --execute --resume.",
+        help="Retry failed measurements within the frozen attempt budget; requires --execute --resume.",
     )
     collection.add_argument(
         "--repeatability-dir",
-        help="Reuse preserved repeat measurements in a fresh offline assessment; selection/count must match.",
+        help="Reuse preserved repeat measurements in a fresh offline assessment; execution policy must match.",
     )
     serving = actions.add_parser(
         "validate-serving",

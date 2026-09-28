@@ -249,10 +249,12 @@ def test_public_prepare_then_repeat_and_holdout_preserve_originals(quality_case)
             assert saved["runtime_observation"] == case["plan"].to_dict()["runtime_observation"]
 
 
-def test_holdout_uses_full_native_grid_not_repeat_subset(quality_case):
+def test_holdout_uses_full_native_grid_not_repeat_subset(quality_case, tmp_path):
     case = quality_case
+    policy = tmp_path / "bounded-policy.json"
+    _write(policy, {"repeatability": {"comparison_mode": "bounded"}})
     before = {path: path.read_bytes() for path in case["root"].rglob("*") if path.is_file()}
-    assert cli.main(case["args"]) == 0
+    assert cli.main([*case["args"], "--policy", str(policy)]) == 0
     selection = json.loads((case["output"] / "repeatability-selection.json").read_text())
     assert all(len(cell["points"]) <= 12 for cell in selection["cells"])
     holdout = json.loads((case["output"] / "holdout/interpolation-validation.json").read_text())
@@ -426,6 +428,10 @@ def test_requalification_rejects_changed_or_forged_evidence(quality_case, which)
     "values",
     [
         {"repeatability": {"samples": True}},
+        {"repeatability": {"comparison_mode": "automatic"}},
+        {"repeatability": {"max_attempts_per_sample": 0}},
+        {"repeatability": {"max_attempts_per_sample": True}},
+        {"repeatability": {"max_source_relative_difference": float("inf")}},
         {"serving": {"max_latency_p95_relative_error": float("nan")}},
         {"serving": {"max_latency_p95_relative_error": -0.1}},
         {"serving": {"max_latency_p95_relative_error": "1e-05"}},
@@ -442,6 +448,125 @@ def test_validation_policy_rejects_ambiguous_settings(values, tmp_path, policy_f
     policy.write_text(json.dumps(values) if policy_format == "json" else yaml.safe_dump(values))
     with pytest.raises(ValueError):
         workflow._policy(policy)
+
+
+def test_repeatability_policy_defaults_and_legacy_semantics(tmp_path):
+    policy = workflow.ValidationPolicy()
+    assert policy.schema_version == "aisimulate-onboarding-validation-policy/v2"
+    assert policy.repeatability.comparison_mode == "full_grid"
+    assert policy.repeatability.max_attempts_per_sample == 2
+    assert policy.repeatability.max_cv == policy.repeatability.max_source_relative_difference == 0.05
+    path = tmp_path / "legacy-policy.json"
+    legacy = {"schema_version": "aisimulate-onboarding-validation-policy/v1", "repeatability": {"samples": 3}}
+    _write(path, legacy)
+    parsed = workflow._policy(path)
+    assert parsed.schema_version == legacy["schema_version"]
+    assert parsed.repeatability.comparison_mode == "bounded"
+    assert parsed.repeatability.samples == 3
+    assert json.loads(path.read_text()) == legacy
+    with pytest.raises(ValueError, match="legacy v1 policy uses bounded"):
+        workflow.ValidationPolicy.model_validate({**legacy, "repeatability": {"comparison_mode": "full_grid"}})
+
+
+@pytest.mark.parametrize("reason", ["legacy", "bounded", "source_missing", "source_failed", "population_unstable"])
+def test_stable_fresh_measurements_do_not_qualify_other_populations(reason):
+    policy = workflow.ValidationPolicy()
+    assessment = {
+        "schema_version": 2,
+        "policy": {"comparison_mode": "full_grid"},
+        "status": "passed",
+        "source_qualification": {"status": "qualified"},
+        "new_population": {"status": "qualified"},
+    }
+    assert workflow._repeatability_gate_status(assessment, policy) == "passed"
+    if reason == "legacy":
+        assessment["schema_version"] = 1
+    elif reason == "bounded":
+        policy = workflow.ValidationPolicy(repeatability={"comparison_mode": "bounded"})
+        assessment["policy"]["comparison_mode"] = "bounded"
+    elif reason == "source_missing":
+        assessment.pop("source_qualification")
+    elif reason == "source_failed":
+        assessment["source_qualification"]["status"] = "failed"
+    else:
+        assessment["new_population"]["status"] = "unstable"
+    expected = "failed" if reason in {"source_failed", "population_unstable"} else "incomplete"
+    assert workflow._repeatability_gate_status(assessment, policy) == expected
+    assessment["status"] = "failed"
+    assert workflow._repeatability_gate_status(assessment, policy) == "failed"
+
+
+@pytest.mark.parametrize(
+    "change", [{"comparison_mode": "bounded"}, {"max_attempts_per_sample": 3}, {"max_source_relative_difference": 0.1}]
+)
+def test_repeatability_policy_resume_rejects_drift_without_replacing_evidence(quality_case, tmp_path, change):
+    case = quality_case
+    policy = tmp_path / "repeat-policy.json"
+    _write(policy, workflow.ValidationPolicy().model_dump(mode="json"))
+    args = [*case["args"], "--policy", str(policy)]
+    assert cli.main(args) == 0
+    preserved = {path: path.read_bytes() for path in case["output"].rglob("*") if path.is_file()}
+    _write(policy, {"repeatability": change})
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([*args, "--resume", "--execute"])
+    assert not case["calls"]
+    assert preserved == {path: path.read_bytes() for path in preserved}
+
+
+def test_collector_cli_passes_frozen_repeatability_settings(quality_case, capsys):
+    case = quality_case
+    assert (
+        collector_cli.main(
+            [
+                "--repeatability-source-campaign",
+                str(case["campaign"]),
+                "--repeatability-source-checkpoint",
+                str(case["checkpoint"]),
+                "--repeatability-output-dir",
+                str(case["output"]),
+                "--repeatability-comparison-mode",
+                "bounded",
+                "--repeatability-max-attempts",
+                "3",
+                "--repeatability-source-agreement-threshold",
+                "0.04",
+                "--plan-only",
+            ]
+        )
+        == 0
+    )
+    frozen = json.loads(capsys.readouterr().out)
+    assert frozen["policy"]["comparison_mode"] == "bounded"
+    assert frozen["policy"]["max_attempts_per_sample"] == 3
+    assert frozen["policy"]["source_agreement_threshold"] == 0.04
+    assert not case["calls"]
+
+
+def test_repeatability_settings_survive_checkpoint_resume_without_execution(quality_case, tmp_path, capsys):
+    from aisimulate.support.checkpoint import save_checkpoint
+
+    case = quality_case
+    policy = workflow.ValidationPolicy().model_dump(mode="json")
+    checkpoint = tmp_path / "onboarding-checkpoint.json"
+    state, _ = save_checkpoint(
+        checkpoint,
+        patch={
+            "configurations": {
+                "worker": {
+                    "draft_request": case["request"].model_dump(mode="json"),
+                    "validation_inputs": {"policy": policy},
+                }
+            }
+        },
+        expected_revision=None,
+        accept=["worker"],
+    )
+    assert state.configurations["worker"].acceptance is not None
+    assert cli.main(["onboard", "resume", "--checkpoint", str(checkpoint)]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["state"]["configurations"]["worker"]["validation_inputs"]["policy"] == policy
+    assert resumed["configurations"]["worker"]["profile_accepted"]
+    assert not case["calls"]
 
 
 def _prepare_matched(case, tmp_path, *, policy=None):

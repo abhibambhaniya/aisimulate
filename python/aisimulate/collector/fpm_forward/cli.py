@@ -40,7 +40,7 @@ def _parser() -> argparse.ArgumentParser:
         help="Retry failed cells while resuming; requires --resume.",
     )
     parser.add_argument("--checkpoint-dir", default=".collector_checkpoint")
-    validation = parser.add_argument_group("Validation subset collection")
+    validation = parser.add_argument_group("Repeatability validation")
     validation.add_argument("--repeatability-source-campaign", default=None, help="Existing frozen campaign directory.")
     validation.add_argument(
         "--repeatability-source-checkpoint", default=None, help="Its passed fpm_forward.json checkpoint."
@@ -49,8 +49,20 @@ def _parser() -> argparse.ArgumentParser:
         "--repeatability-output-dir", default=None, help="Fresh validation output; original data is preserved."
     )
     validation.add_argument("--repeatability-samples", type=int, default=5)
-    validation.add_argument("--repeatability-max-points", type=int, default=12)
+    validation.add_argument(
+        "--repeatability-comparison-mode",
+        choices=("full_grid", "bounded"),
+        default="full_grid",
+        help="Repeat the complete native grid; bounded subsets are diagnostic only.",
+    )
+    validation.add_argument(
+        "--repeatability-max-points", type=int, default=12, help="Representative point budget in bounded mode."
+    )
+    validation.add_argument(
+        "--repeatability-max-attempts", type=int, default=2, help="Attempt budget per fresh sample."
+    )
     validation.add_argument("--repeatability-cv-threshold", type=float, default=0.05)
+    validation.add_argument("--repeatability-source-agreement-threshold", type=float, default=0.05)
     add_fpm_arguments(parser)
     add_fpm_generator_arguments(parser)
     return parser
@@ -93,6 +105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "samples": args.repeatability_samples,
                 "max_points_per_cell": args.repeatability_max_points,
                 "cv_threshold": args.repeatability_cv_threshold,
+                "comparison_mode": args.repeatability_comparison_mode,
+                "max_attempts_per_sample": args.repeatability_max_attempts,
+                "source_agreement_threshold": args.repeatability_source_agreement_threshold,
             }
             if args.plan_only:
                 result = freeze_repeatability_plan(

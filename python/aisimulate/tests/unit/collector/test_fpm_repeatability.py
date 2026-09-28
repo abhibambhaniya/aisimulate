@@ -20,6 +20,7 @@ from collector.fpm_forward.native_artifact import (
 from collector.fpm_forward.runtime import fpm_memory_observer as observer
 from collector.fpm_forward.runtime_memory import validate_saved_plan
 
+from .test_fpm_measurement_evidence import _add_measurement_protocol
 from .test_fpm_profile_collection import _plan, _profile, no_models_or_timing_data  # noqa: F401
 from .test_fpm_runner import _native_payload, _write_provenance
 from .test_fpm_runtime_memory import _vllm_config
@@ -64,10 +65,24 @@ def _write_campaign(
         provenance = json.loads((raw / "collector-provenance.json").read_text())
         provenance["runtime"]["backend_version"] = plan.capability.aic_database_version
         (raw / "collector-provenance.json").write_text(json.dumps(provenance))
-        coords = json.loads(plan.options.benchmark_points_json)[cell.workload_kind]
+        coords = (
+            json.loads(plan.options.benchmark_points_json)[cell.workload_kind]
+            if plan.options.benchmark_points_json
+            else [
+                {
+                    "batch_size": batch,
+                    "total_prefill_tokens": batch if cell.workload_kind == "prefill" else 0,
+                    "total_kv_read_tokens": batch * context,
+                }
+                for batch in (1, 2, 4, 8, 16, 32)
+                for context in (16, 1024)
+            ]
+        )
         points = [_point(item, cell.workload_kind, index + 1) for index, item in enumerate(coords)]
         for rank in range(cell.topology.dp):
-            payload = _native_payload(phase=cell.workload_kind, rank=rank, dp=cell.topology.dp)
+            payload = _native_payload(
+                phase=cell.workload_kind, rank=rank, dp=cell.topology.dp, run_id=f"{attempt_id}-{cell.cell_id}"
+            )
             groups = []
             results = []
             for point in points:
@@ -116,6 +131,12 @@ def _write_campaign(
                     "measured_iteration_seconds": sum(group["wall_time"] for group in groups),
                 },
             )
+            payload.update(
+                limits={"block_size": 16, "max_model_len": plan.options.vllm_max_model_len},
+                recurrent_state={"initialization": "unchanged", "policy": None, "uniform_bound": None},
+                grid_digest=repeatability._canonical_hash(points),
+            )
+            _add_measurement_protocol(payload)
             (raw / f"benchmark-dp{rank}.json").write_text(json.dumps(payload))
             if observed:
                 for tp in range(cell.topology.tp):
@@ -267,6 +288,7 @@ def _fake_collector(monkeypatch, *, factors=None, fail_at=None, duplicate=False,
         if mutate:
             mutate(root, index)
         if index == fail_at:
+            cp.unlink()  # No complete observation exists to retry or aggregate.
             return [{"classification": "campaign_cell_failed", "error_message": "runtime failed"}]
         return []
 
@@ -277,7 +299,9 @@ def _fake_collector(monkeypatch, *, factors=None, fail_at=None, duplicate=False,
 
 def test_freeze_selects_validated_native_extremes_and_reports_unselected_capture_boundaries(campaign):
     plan, source, checkpoint = campaign
-    frozen = repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6)
+    frozen = repeatability.freeze_repeatability_plan(
+        plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded"
+    )
     selected = frozen["cells"][0]
     assert len(selected["points"]) == 6 < selected["source_point_count"]
     assert {point["coordinates"]["batch_size"] for point in selected["points"]} >= {1, 32}
@@ -289,12 +313,14 @@ def test_freeze_selects_validated_native_extremes_and_reports_unselected_capture
     assert selected["execution"]["status"] == "qualified"
     assert selected["execution"]["per_point_dispatch"] == "unreported"
     validate_saved_plan(repeatability._subset_plan(plan, selected).to_dict())
-    assert frozen == repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6)
+    assert frozen == repeatability.freeze_repeatability_plan(
+        plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded"
+    )
 
 
 def test_too_small_budget_cannot_silently_drop_required_regimes(campaign):
     with pytest.raises(ValueError, match="cannot cover.*uncovered"):
-        repeatability.freeze_repeatability_plan(*campaign, max_points_per_cell=1)
+        repeatability.freeze_repeatability_plan(*campaign, max_points_per_cell=1, comparison_mode="bounded")
 
 
 def _add_zero_kv_duplicates(root, *, seed_samples=3):
@@ -328,6 +354,8 @@ def _add_zero_kv_duplicates(root, *, seed_samples=3):
         payload["timing"]["measured_iteration_seconds"] = sum(
             group["wall_time"] for group in payload["iteration_groups"]
         )
+        payload["grid_digest"] = repeatability._canonical_hash([row["point"] for row in payload["results"]])
+        _add_measurement_protocol(payload)
         path.write_text(json.dumps(payload))
 
 
@@ -428,7 +456,9 @@ def test_freeze_rejects_conflicting_zero_kv_duplicates(zero_kv_campaign, conflic
 def test_zero_kv_source_consolidation_preserves_independent_fresh_samples(zero_kv_campaign, tmp_path, monkeypatch):
     _add_zero_kv_duplicates(zero_kv_campaign[1])
     original = runner._file_manifest(zero_kv_campaign[1])
-    calls = _fake_collector(monkeypatch, factors=[0.99, 1.0, 1.01, 1.0, 1.0])
+    calls = _fake_collector(
+        monkeypatch, factors=[0.99, 1.0, 1.01, 1.0, 1.0], mutate=lambda root, _index: _add_zero_kv_duplicates(root)
+    )
     args = _args(zero_kv_campaign, tmp_path)
     report = repeatability.run_repeatability(**args)
     assert report["status"] == "passed" and len(calls) == 5
@@ -449,10 +479,9 @@ def test_zero_kv_duplicates_in_fresh_repeat_are_not_counted_as_independent_sampl
     _add_zero_kv_duplicates(zero_kv_campaign[1])
     calls = _fake_collector(monkeypatch, mutate=lambda root, _index: _add_zero_kv_duplicates(root))
     report = repeatability.run_repeatability(**_args(zero_kv_campaign, tmp_path))
-    assert report["status"] == "failed" and len(calls) == 1
-    assert report["points"][0]["sample_count"] == 0
-    failed = report["samples"][zero_kv_campaign[0].cells[0].cell_id][0]["attempts"][-1]
-    assert "did not measure exactly the frozen subset" in failed["error"]
+    assert report["status"] == "passed" and len(calls) == 5
+    assert len(report["points"]) == 1
+    assert report["points"][0]["sample_count"] == 5
 
 
 def test_five_independent_samples_keep_raw_data_and_pass_without_formal_publication(campaign, tmp_path, monkeypatch):
@@ -461,7 +490,8 @@ def test_five_independent_samples_keep_raw_data_and_pass_without_formal_publicat
     args = _args(campaign, tmp_path, max_points_per_cell=6)
     report = repeatability.run_repeatability(**args)
     assert report["status"] == "passed" and len(calls) == 5
-    assert all(len(json.loads(plan.options.benchmark_points_json)["prefill"]) == 6 for plan, _ in calls)
+    assert all(plan.options == campaign[0].options for plan, _ in calls)
+    assert len(report["points"]) == 12
     assert len({kwargs["artifact_root"] for _, kwargs in calls}) == 5
     assert runner._file_manifest(campaign[1]) == originals
     assert all(point["sample_count"] == 5 and len(point["samples_seconds"]) == 5 for point in report["points"])
@@ -707,6 +737,8 @@ def test_unstable_points_fail_and_can_be_reassessed_without_new_launches(campaig
     assert report["status"] == "failed" and report["repeatability"]["status"] == "unstable"
     frozen = json.loads((args["output_dir"] / repeatability.PLAN_FILENAME).read_text())
     reassessed = repeatability.assess_repeatability(frozen, report, cv_threshold=0.75)
+    assert reassessed["status"] == "failed"  # Source agreement remains a separate criterion.
+    reassessed = repeatability.assess_repeatability(frozen, report, cv_threshold=0.75, source_agreement_threshold=0.75)
     assert reassessed["status"] == "passed" and len(calls) == 5
     assert report["status"] == "failed"
     assert reassessed["assessment"]["cv_threshold"] == 0.75
@@ -719,6 +751,9 @@ def test_stable_new_samples_do_not_accept_an_outlying_published_measurement(camp
     originals = runner._file_manifest(source)
     report = repeatability.run_repeatability(**_args(campaign, tmp_path))
     assert report["status"] == "failed"
+    assert report["new_population"]["status"] == "qualified"
+    assert report["repeatability"]["status"] == "passed"
+    assert report["source_qualification"]["status"] == "failed"
     assert all(point["sample_cv"] == 0 and point["source_inclusive_cv"] > 0.05 for point in report["points"])
     assert all(point["source_inclusive_sample_count"] == 6 for point in report["points"])
     assert runner._file_manifest(source) == originals
@@ -940,3 +975,400 @@ def test_failed_source_point_is_never_selected(campaign):
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="invalid native terminal"):
         repeatability.freeze_repeatability_plan(plan, source, checkpoint)
+
+
+def _mutate_native(root, action):
+    for path in root.glob("cells/*/raw/*/benchmark-*.json"):
+        payload = json.loads(path.read_text())
+        action(payload)
+        path.write_text(json.dumps(payload))
+
+
+def _remove_protocol(payload):
+    payload.pop("measurement_protocol")
+    for row in payload["results"]:
+        for fpm in row["fpms"]:
+            fpm.pop("benchmark_measurement", None)
+    for group in payload["iteration_groups"]:
+        for rank in group["rank_results"]:
+            for fpm in rank["fpms"]:
+                fpm.pop("benchmark_measurement", None)
+
+
+def test_full_sweep_preserves_native_generation_and_assesses_every_coordinate(campaign, tmp_path, monkeypatch):
+    original, source, checkpoint = campaign
+    original = replace(
+        original, options=replace(original.options, benchmark_points_json=None, benchmark_points_sha256=None)
+    )
+    plan = repeatability._subset_plan(
+        original, {"cell_id": original.cells[0].cell_id, "benchmark_points": {}}, comparison_mode="full_grid"
+    )
+    _write_campaign(source, checkpoint, plan)
+    calls = _fake_collector(monkeypatch)
+    result = repeatability.run_repeatability(**_args((plan, source, checkpoint), tmp_path, max_points_per_cell=1))
+    assert result["status"] == "passed"
+    assert len(result["points"]) == 12
+    assert all(call.options == plan.options and call.options.benchmark_points_json is None for call, _ in calls)
+    aggregate = json.loads(Path(result["aggregate"]["path"]).read_text())
+    assert aggregate["status"] == "qualified"
+    assert aggregate["formal_source_replaced"] is False
+    assert all(point["median_seconds"] == statistics.median(point["samples_seconds"]) for point in aggregate["points"])
+
+
+def test_bounded_population_never_qualifies_source_or_blends_source_timing(campaign, tmp_path, monkeypatch):
+    calls = _fake_collector(monkeypatch, factors=[2.0])
+    result = repeatability.run_repeatability(
+        **_args(campaign, tmp_path, comparison_mode="bounded", max_points_per_cell=6)
+    )
+    assert len(calls) == 5 and len(result["points"]) == 6
+    assert result["status"] == "incomplete"
+    assert result["new_population"] == {"status": "qualified", "scope": "bounded_diagnostic"}
+    assert result["source_qualification"]["status"] == "unestablished"
+    assert result["repeatability"]["status"] == "passed"
+    assert all(point["sample_cv"] == 0 and point["source_inclusive_cv"] > 0.05 for point in result["points"])
+    assert all(point["source_comparison"]["context"] == "cross_context_unproven" for point in result["points"])
+
+
+def test_legacy_source_does_not_prevent_new_comparable_population(campaign, tmp_path, monkeypatch):
+    _mutate_native(campaign[1], _remove_protocol)
+    calls = _fake_collector(monkeypatch)
+    result = repeatability.run_repeatability(**_args(campaign, tmp_path))
+    assert len(calls) == 5
+    assert result["status"] == "incomplete"
+    assert result["new_population"]["status"] == "qualified"
+    assert result["source_qualification"]["status"] == "unestablished"
+    assert all(point["source_relative_difference"] is None for point in result["points"])
+
+
+def test_missing_new_protocol_preserves_raw_values_without_qualified_statistics(campaign, tmp_path, monkeypatch):
+    _fake_collector(monkeypatch, mutate=lambda root, _index: _mutate_native(root, _remove_protocol))
+    result = repeatability.run_repeatability(**_args(campaign, tmp_path))
+    assert result["new_population"]["status"] == "unestablished"
+    assert all(len(point["raw_samples_seconds"]) == 5 and point["samples_seconds"] == [] for point in result["points"])
+    assert all(point["sample_cv"] is None for point in result["points"])
+
+
+def test_changed_prompt_seed_cannot_enter_same_population(campaign, tmp_path, monkeypatch):
+    def mutate(root, index):
+        if index == 2:
+            _mutate_native(root, lambda payload: _add_measurement_protocol(payload, seed="different"))
+
+    calls = _fake_collector(monkeypatch, mutate=mutate)
+    result = repeatability.run_repeatability(**_args(campaign, tmp_path))
+    assert len(calls) == 2 and result["status"] == "failed"
+    assert result["repeatability"]["status"] == "mismatch"
+    assert all(point["sample_cv"] is None and len(point["raw_samples_seconds"]) == 2 for point in result["points"])
+
+
+def test_valid_slow_outlier_is_retained_and_cannot_be_retried_away(campaign, tmp_path, monkeypatch):
+    calls = _fake_collector(monkeypatch, factors=[1, 1, 3, 1, 1])
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    assert result["new_population"]["status"] == "unstable"
+    assert all(point["median_seconds"] == point["source_wall_time_seconds"] for point in result["points"])
+    assert all(max(point["samples_seconds"]) == 3 * point["median_seconds"] for point in result["points"])
+    assert repeatability.run_repeatability(**args, resume=True, retry_failed=True) == result
+    assert len(calls) == 5
+
+
+def test_retry_budget_is_frozen_and_finite(campaign, tmp_path, monkeypatch):
+    calls = _fake_collector(monkeypatch, fail_at=1)
+    args = _args(campaign, tmp_path, max_attempts_per_sample=1)
+    repeatability.run_repeatability(**args)
+    with pytest.raises(ValueError, match="retry budget exhausted"):
+        repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    with pytest.raises(ValueError, match="frozen plan.*changed"):
+        repeatability.run_repeatability(**{**args, "max_attempts_per_sample": 2}, resume=True, retry_failed=True)
+    assert len(calls) == 1
+
+
+def test_distinct_attempt_ids_do_not_make_reused_runtime_run_independent(campaign, tmp_path, monkeypatch):
+    def mutate(root, _index):
+        _mutate_native(root, lambda payload: payload.update(run_id="reused-runtime-run"))
+
+    calls = _fake_collector(monkeypatch, mutate=mutate)
+    result = repeatability.run_repeatability(**_args(campaign, tmp_path))
+    assert result["status"] == "failed" and len(calls) == 2
+    attempt = result["samples"][campaign[0].cells[0].cell_id][1]["attempts"][0]
+    assert "runtime run" in attempt["error"]
+
+
+def test_complete_measurement_survives_later_collection_error_and_is_not_replaced(campaign, tmp_path, monkeypatch):
+    calls = _fake_collector(monkeypatch)
+    collect = repeatability.run_collection
+
+    def fail_after_collection(plan, **kwargs):
+        collect(plan, **kwargs)
+        return [{"classification": "teardown_error"}]
+
+    monkeypatch.setattr(repeatability, "run_collection", fail_after_collection)
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    assert result["status"] == "incomplete"
+    assert all(point["raw_sample_count"] == 1 for point in result["points"])
+    assert repeatability.run_repeatability(**args, resume=True, retry_failed=True) == result
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("collector_status", "cleanup_error"),
+    [("failed", False), ("interrupted", False), ("running", False), ("failed", True)],
+)
+def test_complete_failed_native_observation_requires_cpu_recovery_without_replacement(
+    campaign, tmp_path, monkeypatch, collector_status, cleanup_error
+):
+    calls = _fake_collector(monkeypatch, factors=[3, 1, 1, 1, 1])
+    collect = repeatability.run_collection
+    cell_id = campaign[0].cells[0].cell_id
+    monkeypatch.setattr(runner, "_cell_runner", lambda *_args: SimpleNamespace(cleanup=lambda: None))
+
+    def fail_after_native_collection(plan, **kwargs):
+        result = collect(plan, **kwargs)
+        if len(calls) == 1:
+            path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
+            checkpoint = json.loads(path.read_text())
+            entry = checkpoint["cells"][cell_id]
+            entry.update(status=collector_status, error_type="RuntimeError", error="log retrieval failed")
+            if cleanup_error:
+                entry["cleanup_error"] = "teardown timed out"
+            path.write_text(json.dumps(checkpoint))
+            if collector_status == "interrupted":
+                raise KeyboardInterrupt("interrupted after native artifacts were copied")
+            return [{"classification": "campaign_cell_failed", "error_message": entry["error"]}]
+        return result
+
+    monkeypatch.setattr(repeatability, "run_collection", fail_after_native_collection)
+    args = _args(campaign, tmp_path)
+    if collector_status == "interrupted":
+        with pytest.raises(KeyboardInterrupt, match="artifacts were copied"):
+            repeatability.run_repeatability(**args)
+    else:
+        repeatability.run_repeatability(**args)
+    result = repeatability.run_repeatability(**args, resume=True)
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert len(calls) == 1 and result["status"] == "incomplete"
+    assert attempt["evidence"]["collector_status"] == collector_status
+    assert attempt["evidence"]["collector_error"]["error"] == "log retrieval failed"
+    assert all(point["raw_samples_seconds"] == [3 * point["source_wall_time_seconds"]] for point in result["points"])
+    checkpoint_path = Path(calls[0][1]["checkpoint_dir"]) / "fpm_forward.json"
+    original_checkpoint = checkpoint_path.read_bytes()
+
+    recover = repeatability._recover_completed_attempt
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args: None)
+    result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert len(calls) == 1 and result["status"] == "incomplete"
+    assert attempt["postprocessing_attempts"][-1]["status"] == "failed"
+    assert "cannot be replaced" in attempt["postprocessing_attempts"][-1]["error"]
+
+    monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover)
+    result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    assert len(calls) == 5 and result["new_population"]["status"] == "unstable"
+    assert all(point["raw_samples_seconds"][0] == 3 * point["source_wall_time_seconds"] for point in result["points"])
+    assert all(point["sample_count"] == 5 and point["sample_cv"] > 0.05 for point in result["points"])
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert [item["status"] for item in attempt["postprocessing_attempts"]] == ["failed", "passed"]
+    assert attempt["postprocessing_attempts"][-1]["artifact_recovery"]["original_status"] == collector_status
+    assert all(len(sample["attempts"]) == 1 for sample in result["samples"][cell_id])
+    assert checkpoint_path.read_bytes() == original_checkpoint
+    assert repeatability.run_repeatability(**args, resume=True, retry_failed=True) == result
+    assert len(calls) == 5
+
+
+@pytest.mark.parametrize("defect", ["missing_rank", "partial_point", "wrong_attempt"])
+def test_failed_checkpoint_with_invalid_native_artifacts_remains_retryable(campaign, tmp_path, monkeypatch, defect):
+    def invalidate(root, index):
+        if index != 1:
+            return
+        path = next(root.glob("cells/*/raw/*/benchmark-*.json"))
+        if defect == "missing_rank":
+            path.unlink()
+        elif defect == "partial_point":
+            payload = json.loads(path.read_text())
+            payload["results"].pop()
+            path.write_text(json.dumps(payload))
+        else:
+            path = next(root.glob("cells/*/raw/*/collector-provenance.json"))
+            payload = json.loads(path.read_text())
+            payload["attempt_id"] = "unrelated-attempt"
+            path.write_text(json.dumps(payload))
+
+    calls = _fake_collector(monkeypatch, mutate=invalidate)
+    collect = repeatability.run_collection
+    cell_id = campaign[0].cells[0].cell_id
+
+    def fail_partial(plan, **kwargs):
+        result = collect(plan, **kwargs)
+        if len(calls) == 1:
+            path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
+            checkpoint = json.loads(path.read_text())
+            checkpoint["cells"][cell_id].update(status="failed", error="incomplete artifact collection")
+            path.write_text(json.dumps(checkpoint))
+            return [{"classification": "campaign_cell_failed"}]
+        return result
+
+    monkeypatch.setattr(repeatability, "run_collection", fail_partial)
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    assert all(point["raw_sample_count"] == 0 for point in result["points"])
+    result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    assert result["status"] == "passed" and len(calls) == 6
+    attempts = result["samples"][cell_id][0]["attempts"]
+    assert [attempt["status"] for attempt in attempts] == ["failed", "passed"]
+    assert "evidence" not in attempts[0]
+
+
+def test_failed_checkpoint_never_recovers_a_wrong_runtime_configuration(campaign, tmp_path, monkeypatch):
+    def wrong_runtime(root, _index):
+        for path in root.glob("cells/*/raw/*/fpm-execution*.json"):
+            payload = json.loads(path.read_text())
+            payload["resolved_config"]["model_config"]["revision"] = "wrong-model-revision"
+            path.write_text(json.dumps(payload))
+
+    calls = _fake_collector(monkeypatch, mutate=wrong_runtime)
+    collect = repeatability.run_collection
+    cell_id = campaign[0].cells[0].cell_id
+
+    def fail_after_wrong_runtime(plan, **kwargs):
+        collect(plan, **kwargs)
+        path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
+        checkpoint = json.loads(path.read_text())
+        checkpoint["cells"][cell_id].update(status="failed", error="log retrieval failed")
+        path.write_text(json.dumps(checkpoint))
+        return [{"classification": "campaign_cell_failed"}]
+
+    monkeypatch.setattr(repeatability, "run_collection", fail_after_wrong_runtime)
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert result["status"] == "failed" and attempt["failure_kind"] == "validation_failed"
+    assert attempt["evidence"]["execution"]["status"] == "failed"
+    assert repeatability.run_repeatability(**args, resume=True, retry_failed=True) == result
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("interrupted_cleanup", [False, True])
+def test_cleanup_failed_checkpoint_retains_slow_measurement_and_retries_only_cleanup(
+    campaign, tmp_path, monkeypatch, interrupted_cleanup
+):
+    calls = _fake_collector(monkeypatch, factors=[3, 1, 1, 1, 1])
+    collect = repeatability.run_collection
+    cell_id = campaign[0].cells[0].cell_id
+
+    def fail_cleanup(plan, **kwargs):
+        result = collect(plan, **kwargs)
+        if len(calls) == 1:
+            path = Path(kwargs["checkpoint_dir"]) / "fpm_forward.json"
+            checkpoint = json.loads(path.read_text())
+            checkpoint["cells"][cell_id].update(status="cleanup_failed", cleanup_error="transport timeout")
+            path.write_text(json.dumps(checkpoint))
+            return [{"classification": "resource_cleanup_failed", "error_message": "transport timeout"}]
+        return result
+
+    monkeypatch.setattr(repeatability, "run_collection", fail_cleanup)
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert attempt["failure_kind"] == "cleanup_failed"
+    assert attempt["evidence"]["collector_status"] == "cleanup_failed"
+    assert result["execution"]["status"] == result["status"] == "incomplete"
+    assert all(point["raw_samples_seconds"] == [3 * point["source_wall_time_seconds"]] for point in result["points"])
+    assert repeatability.run_repeatability(**args, resume=True) == result
+    assert len(calls) == 1
+    checkpoint_path = Path(calls[0][1]["checkpoint_dir"]) / "fpm_forward.json"
+    original_checkpoint = checkpoint_path.read_bytes()
+
+    def cleanup_still_fails():
+        (checkpoint_path.parent.parent / "cleanup.log").write_text("cleanup attempted")
+        if interrupted_cleanup:
+            raise KeyboardInterrupt("cleanup interrupted")
+        raise RuntimeError("cleanup still unavailable")
+
+    monkeypatch.setattr(repeatability, "_cell_runner", lambda *_args: SimpleNamespace(cleanup=cleanup_still_fails))
+    if interrupted_cleanup:
+        with pytest.raises(KeyboardInterrupt, match="cleanup interrupted"):
+            repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        result = json.loads((args["output_dir"] / repeatability.REPORT_FILENAME).read_text())
+    else:
+        result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    assert len(calls) == 1 and result["status"] == "incomplete"
+    failed_status = "interrupted" if interrupted_cleanup else "failed"
+    assert result["samples"][cell_id][0]["attempts"][0]["cleanup_attempts"][-1]["status"] == failed_status
+    monkeypatch.setattr(repeatability, "_cell_runner", lambda *_args: SimpleNamespace(cleanup=lambda: None))
+    result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+    assert len(calls) == 5
+    assert result["new_population"]["status"] == "unstable"
+    assert all(point["sample_count"] == 5 and point["sample_cv"] > 0.05 for point in result["points"])
+    assert all(point["raw_samples_seconds"][0] == 3 * point["source_wall_time_seconds"] for point in result["points"])
+    attempt = result["samples"][cell_id][0]["attempts"][0]
+    assert [item["status"] for item in attempt["cleanup_attempts"]] == [failed_status, "passed"]
+    assert attempt["errors"][0]["classification"] == "resource_cleanup_failed"
+    assert checkpoint_path.read_bytes() == original_checkpoint
+    assert all(len(sample["attempts"]) == 1 for sample in result["samples"][cell_id])
+    assert repeatability.run_repeatability(**args, resume=True, retry_failed=True) == result
+    assert len(calls) == 5
+
+
+@pytest.mark.parametrize("sample_count", [1, 5])
+def test_interrupted_aggregate_publication_recovers_completed_observation(
+    campaign, tmp_path, monkeypatch, sample_count
+):
+    calls = _fake_collector(monkeypatch)
+    args = _args(campaign, tmp_path)
+    atomic = repeatability._atomic_json
+    interrupted = False
+
+    def interrupt_report(path, payload):
+        nonlocal interrupted
+        if (
+            Path(path).name == repeatability.REPORT_FILENAME
+            and payload.get("points")
+            and payload["points"][0].get("raw_sample_count") == sample_count
+            and not interrupted
+        ):
+            interrupted = True
+            raise KeyboardInterrupt("interrupted after aggregate publication")
+        return atomic(path, payload)
+
+    monkeypatch.setattr(repeatability, "_atomic_json", interrupt_report)
+    with pytest.raises(KeyboardInterrupt, match="aggregate publication"):
+        repeatability.run_repeatability(**args)
+    saved = json.loads((args["output_dir"] / repeatability.REPORT_FILENAME).read_text())
+    assert repeatability.file_evidence(Path(saved["aggregate"]["path"])) == saved["aggregate"]
+    assert len(calls) == sample_count
+    monkeypatch.setattr(repeatability, "_atomic_json", atomic)
+    result = repeatability.run_repeatability(**args, resume=True)
+    assert result["status"] == "passed" and len(calls) == 5
+    assert all(len(sample["attempts"]) == 1 for sample in result["samples"][campaign[0].cells[0].cell_id])
+    assert repeatability.file_evidence(Path(saved["aggregate"]["path"])) == saved["aggregate"]
+    assert repeatability.run_repeatability(**args, resume=True) == result
+
+
+def test_immutable_aggregate_tampering_still_rejects_resume(campaign, tmp_path, monkeypatch):
+    calls = _fake_collector(monkeypatch)
+    args = _args(campaign, tmp_path)
+    result = repeatability.run_repeatability(**args)
+    aggregate = Path(result["aggregate"]["path"])
+    payload = json.loads(aggregate.read_text())
+    payload["points"][0]["median_seconds"] *= 0.5
+    aggregate.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="aggregate artifact changed"):
+        repeatability.run_repeatability(**args, resume=True)
+    assert len(calls) == 5
+
+
+def test_legacy_report_stays_historical_and_unqualified_during_offline_inspection(campaign, tmp_path, monkeypatch):
+    _fake_collector(monkeypatch)
+    args = _args(campaign, tmp_path)
+    report = repeatability.run_repeatability(**args)
+    frozen = json.loads((args["output_dir"] / repeatability.PLAN_FILENAME).read_text())
+    frozen["schema_version"] = 1
+    frozen["sha256"] = repeatability._canonical_hash({key: value for key, value in frozen.items() if key != "sha256"})
+    report["schema_version"] = 1
+    report["plan_sha256"] = frozen["sha256"]
+    before = copy.deepcopy(report)
+    inspected = repeatability.assess_repeatability(frozen, report, cv_threshold=0.05)
+    assert inspected["schema_version"] == 1 and inspected["status"] == "incomplete"
+    assert inspected["historical_assessment"]["status"] == "passed"
+    assert inspected["source_qualification"]["status"] == "unestablished"
+    assert report == before

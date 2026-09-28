@@ -297,10 +297,22 @@ save an editable campaign policy before measurement, then run `onboard
 validate-collection` against the original collection directory. Preparation omits
 `--execute` and does not pass quality or accuracy gates. Inspect native validity,
 actual attention groups, graph configuration and KV initialization; run the
-fresh bounded representative repeats only with explicit `--execute`. Preserve
-individual attempts and inspect both fresh-sample CV and CV including the
-original published sample. Repeatability uses the same canonical source sample
-selection as publication without modifying raw artifacts. Evaluate withheld
+fresh full-grid repetitions only with explicit `--execute`. Freeze the comparison
+mode, count, retry budget and source protocol/seed/preparation before execution;
+record them in checkpoint `validation_inputs`. Each independent observation is
+one fresh engine launch, reduced across ranks by the existing maximum estimator.
+Compare matching per-rank prompt evidence, runtime, graph/KV regime and preparation
+before pooling samples. Missing evidence remains unestablished; injected-prompt
+hashes do not prove identical sampled continuations or KV/recurrent tensors.
+Preserve all attempts and valid slow samples; use their median as a separate
+aggregate and all valid independent estimates for CV. Internal adjacent decode
+steps and zero-KV provenance duplicates are not independent samples. The
+source-inclusive CV is diagnostic only. Qualifying the original table also
+requires comparable full-grid source evidence and source-to-median agreement;
+stable fresh measurements cannot qualify missing or mismatched historical evidence.
+Bounded subsets retain different sweep history and remain diagnostic, without
+passing the full-grid quality gate. Repeatability uses the same canonical source
+sample selection as publication without modifying raw artifacts. Evaluate withheld
 coordinates through native direct interpolation; keep unsupported queries
 separate from numerical errors. Holdout selection retains both adjacent measured
 anchors at execution-mode transitions using the complete validated native grid
@@ -311,13 +323,18 @@ prove all brackets compatible, test missing-boundary behavior or resolve kernel
 changes within one graph mode. A changed selection requires a fresh CPU assessment
 directory; retain earlier failures and reports without altering the formal table
 or repeatability subset. The
-default policy is five fresh samples per point, at most 12 points per phase cell,
-maximum CV 0.05, at most 16 holdouts per phase, seed 42, p95 absolute relative
-error 0.20 and zero unsupported holdouts. These are editable initial criteria,
-not statistical confidence guarantees. Do not overwrite original collection or
-policy snapshots. Threshold changes use fresh assessment directories and can
-reuse verified raw samples; changed selection/count/execution requires new
-measurements. Old campaigns lacking source/runtime evidence remain incomplete.
+default v2 policy is five fresh full-grid runs per phase, two attempts per sample
+at most, maximum CV 0.05 and source-to-median relative difference 0.05. Bounded
+diagnostics default to at most 12 points per phase cell. Interpolation defaults
+remain at most 16 holdouts per phase, seed 42, p95 absolute relative error 0.20
+and zero unsupported holdouts. These are editable initial criteria, not
+statistical confidence guarantees. Do not relax CV or choose faster retries to
+hide instability. Do not overwrite original collection or policy snapshots.
+Threshold changes use fresh assessment directories and can reuse verified raw
+samples; changed selection/count/mode/attempt budget/execution requires a new
+measurement campaign. Resume rejects drift. Explicit v1 policy retains its old
+bounded semantics and cannot qualify; use a fresh directory for v2. Old campaigns
+lacking source/runtime/protocol evidence remain incomplete.
 
 After verifying the formal data pair and resolving memory, use `aisimulate onboard validate-fpm`
 with a local Weka trace and a separate validation output directory. Follow the

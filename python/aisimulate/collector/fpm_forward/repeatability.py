@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, independent native remeasurement of a validated collection.
+"""Independent native sweep repetitions with auditable measurement evidence.
 
 AISimulate selects coordinates already measured by the source campaign. Dynamo
 owns their admission and execution through its existing explicit-point API:
@@ -26,6 +26,7 @@ from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
 from .config import FPMCollectionOptions, with_kv_warmup_defaults
 from .execution_evidence import file_evidence, inspect_execution_evidence
+from .measurement_evidence import compare_measurements, extract_measurement_evidence
 from .memory_admission import DTypeMemoryEstimate, TopologyMemoryDecision
 from .model_capability import ResolvedModelConfig
 from .native_artifact import (
@@ -38,9 +39,11 @@ from .native_artifact import (
 from .planner import BackendPolicy, FPMCollectionPlan, _canonical_hash, _hash_stable_admission
 from .runner import (
     CHECKPOINT_SCHEMA,
+    FPM_RECOVERABLE_STATUSES,
     _atomic_json,
     _cell_runner,
     _file_manifest,
+    _recover_completed_attempt,
     _validate_points_receipts,
     run_collection,
 )
@@ -49,6 +52,7 @@ from .types import ParallelTopology
 
 PLAN_FILENAME = "repeatability-plan.json"
 REPORT_FILENAME = "repeatability.json"
+AGGREGATE_FILENAME = "repeatability-aggregate.json"
 _LAUNCH_FILES = ("generator-request.json", "run.sh", "fpm_env.sh", "collector-runtime-env.sh")
 
 
@@ -191,7 +195,7 @@ def _regime(measurement: NativePointMeasurement) -> tuple[Any, ...]:
     )
 
 
-def _select_points(collection: NativeCollection, limit: int, *, cell_id: str) -> list[dict[str, Any]]:
+def _select_points(collection: NativeCollection, limit: int | None, *, cell_id: str) -> list[dict[str, Any]]:
     """Cover extremes and regime/boundary representatives with a fixed budget."""
     points = sorted(
         select_native_measurements(collection, cell_id=cell_id),
@@ -234,8 +238,8 @@ def _select_points(collection: NativeCollection, limit: int, *, cell_id: str) ->
             for index, value in enumerate(token_axis):
                 if value == target:
                     roles[index].add(f"capture_{boundary}_{label}")
-    uncovered = set().union(*roles)
-    selected = set()
+    uncovered = set().union(*roles) if limit is not None else set()
+    selected = set() if limit is not None else set(range(len(points)))
     while uncovered:
         index = max(range(len(points)), key=lambda index: (len(roles[index] & uncovered), -index))
         if len(selected) == limit:
@@ -247,7 +251,7 @@ def _select_points(collection: NativeCollection, limit: int, *, cell_id: str) ->
         uncovered -= roles[index]
     # Fill remaining slots evenly across the sorted native grid. Every sample
     # remains a measured point, including when the source grid itself is small.
-    target_count = min(limit, len(points))
+    target_count = min(limit, len(points)) if limit is not None else len(points)
     candidates = [round(index * (len(points) - 1) / max(1, target_count - 1)) for index in range(target_count)]
     for index in [*candidates, *range(len(points))]:
         if len(selected) >= target_count:
@@ -261,7 +265,7 @@ def _select_points(collection: NativeCollection, limit: int, *, cell_id: str) ->
             "source_wall_time_seconds": max(value for _, value in points[index].rank_wall_times),
             "source_rank_wall_times": [list(value) for value in points[index].rank_wall_times],
             "kv_seed_regime": points[index].kv_seed_regime,
-            "selection_reasons": sorted(roles[index]),
+            "selection_reasons": sorted(roles[index]) if limit is not None else ["full_native_sweep"],
         }
         for index in sorted(selected)
     ]
@@ -275,6 +279,9 @@ def freeze_repeatability_plan(
     samples: int = 5,
     max_points_per_cell: int = 12,
     cv_threshold: float = 0.05,
+    comparison_mode: str = "full_grid",
+    max_attempts_per_sample: int = 2,
+    source_agreement_threshold: float = 0.05,
 ) -> dict[str, Any]:
     """Inspect validated source artifacts and return a deterministic frozen plan."""
     if type(samples) is not int or samples < 2:
@@ -283,6 +290,16 @@ def freeze_repeatability_plan(
         raise ValueError("repeatability max_points_per_cell must be a positive integer")
     if type(cv_threshold) not in (int, float) or not math.isfinite(cv_threshold) or cv_threshold < 0:
         raise ValueError("repeatability cv_threshold must be finite and nonnegative")
+    if comparison_mode not in {"full_grid", "bounded"}:
+        raise ValueError("repeatability comparison_mode must be full_grid or bounded")
+    if type(max_attempts_per_sample) is not int or max_attempts_per_sample < 1:
+        raise ValueError("repeatability max_attempts_per_sample must be a positive integer")
+    if (
+        type(source_agreement_threshold) not in (int, float)
+        or not math.isfinite(source_agreement_threshold)
+        or source_agreement_threshold < 0
+    ):
+        raise ValueError("repeatability source_agreement_threshold must be finite and nonnegative")
     root = Path(source_campaign_dir).expanduser().resolve()
     checkpoint_path = Path(source_checkpoint_path).expanduser().resolve()
     saved = json.loads((root / "collection-plan.json").read_text())
@@ -305,11 +322,15 @@ def freeze_repeatability_plan(
             expected_attempt_id=entry["attempt_id"],
         )
         _validate_points_receipts(source_plan, cell, cell_dir / "raw", entry["attempt_id"])
-        selected = _select_points(collection, max_points_per_cell, cell_id=cell.cell_id)
+        selected = _select_points(
+            collection, max_points_per_cell if comparison_mode == "bounded" else None, cell_id=cell.cell_id
+        )
         capture_sizes = sorted(
             {value for item in collection.points if (value := item.point.get("expected_capture_size")) is not None}
         )
-        selected_boundaries = sorted(set(capture_sizes[:1] + capture_sizes[-1:]))
+        selected_boundaries = (
+            sorted(set(capture_sizes[:1] + capture_sizes[-1:])) if comparison_mode == "bounded" else capture_sizes
+        )
         manifest = {"schema_version": 3, "prefill": [], "decode": []}
         manifest[cell.workload_kind] = [item["coordinates"] for item in selected]
         cells.append(
@@ -317,6 +338,8 @@ def freeze_repeatability_plan(
                 "cell_id": cell.cell_id,
                 "phase": cell.workload_kind,
                 "source_attempt_id": collection.collector_attempt_id,
+                "source_runtime_run_id": collection.runtime_run_id,
+                "source_measurement": extract_measurement_evidence(cell_dir / "raw", collection),
                 "source_point_count": len(collection.points),
                 "points": selected,
                 "selection_coverage": {
@@ -337,27 +360,40 @@ def freeze_repeatability_plan(
         )
     payload = {
         "schema_name": "aisimulate_fpm_repeatability_plan",
-        "schema_version": 1,
+        "schema_version": 2,
         "source_plan_sha256": source_plan.sha256,
         "source_campaign_dir": str(root),
         "source_checkpoint": file_evidence(checkpoint_path),
         "source_deployment": file_evidence(root / "generator-overrides.json")
         if (root / "generator-overrides.json").is_file()
         else None,
-        "policy": {"samples": samples, "max_points_per_cell": max_points_per_cell, "cv_threshold": cv_threshold},
-        "sampling": "independent_native_subset_launches",
+        "policy": {
+            "samples": samples,
+            "max_points_per_cell": max_points_per_cell,
+            "cv_threshold": cv_threshold,
+            "comparison_mode": comparison_mode,
+            "max_attempts_per_sample": max_attempts_per_sample,
+            "source_agreement_threshold": source_agreement_threshold,
+        },
+        "sampling": "independent_native_full_sweep_launches"
+        if comparison_mode == "full_grid"
+        else "independent_native_subset_launches",
         "cells": cells,
     }
     return {**payload, "sha256": _canonical_hash(payload)}
 
 
-def _subset_plan(source: FPMCollectionPlan, selected: dict[str, Any]) -> FPMCollectionPlan:
+def _subset_plan(
+    source: FPMCollectionPlan, selected: dict[str, Any], *, comparison_mode: str = "bounded"
+) -> FPMCollectionPlan:
     canonical = json.dumps(selected["benchmark_points"], sort_keys=True, separators=(",", ":"))
     options = replace(
         source.options,
         benchmark_points_json=canonical,
         benchmark_points_sha256=_canonical_hash(selected["benchmark_points"]),
     )
+    if comparison_mode == "full_grid":
+        options = source.options
     plan = replace(
         source, options=options, cells=tuple(cell for cell in source.cells if cell.cell_id == selected["cell_id"])
     )
@@ -385,14 +421,37 @@ def _subset_plan(source: FPMCollectionPlan, selected: dict[str, Any]) -> FPMColl
     return replace(plan, sha256=_canonical_hash(payload))
 
 
+def _worker_identity(evidence):
+    return sorted(
+        [
+            {
+                key: worker[key]
+                for key in (
+                    "dp_rank",
+                    "tp_rank",
+                    "pp_rank",
+                    "backend_version",
+                    "attention_groups",
+                    "graph_config",
+                    "resolved_config",
+                )
+            }
+            for worker in evidence["observed_workers"]
+        ],
+        key=lambda worker: (worker["dp_rank"], worker["tp_rank"], worker["pp_rank"]),
+    )
+
+
 def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], directory: Path) -> dict[str, Any]:
     checkpoint = json.loads((directory / "checkpoint" / "fpm_forward.json").read_text())
     cell = plan.cells[0]
     entry = checkpoint.get("cells", {}).get(cell.cell_id, {})
-    if entry.get("status") != "passed" or not entry.get("attempt_id"):
+    if entry.get("status") not in {"passed", "cleanup_failed", *FPM_RECOVERABLE_STATUSES} or not entry.get(
+        "attempt_id"
+    ):
         raise _IncompleteSample("repeatability sample collector checkpoint is not complete")
-    if checkpoint.get("plan_sha256") != plan.sha256:
-        raise ValueError("repeatability sample collector checkpoint is not passed")
+    if checkpoint.get("schema") != CHECKPOINT_SCHEMA or checkpoint.get("plan_sha256") != plan.sha256:
+        raise ValueError("repeatability sample collector checkpoint identity changed")
     root = directory / "artifacts" / plan.sha256[:16] / "cells" / cell.cell_id
     rank_payloads = _rank_artifacts(root / "raw")
     if not rank_payloads or len(rank_payloads) < cell.topology.dp:
@@ -404,10 +463,11 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
         expected_attempt_id=entry["attempt_id"],
     )
     _validate_points_receipts(plan, cell, root / "raw", entry["attempt_id"])
-    actual = {_point_key(item.point): item for item in collection.points}
+    canonical = select_native_measurements(collection, cell_id=cell.cell_id)
+    actual = {_point_key(item.point): item for item in canonical}
     expected = {item["key"]: item for item in selected["points"]}
-    if len(actual) != len(collection.points) or set(actual) != set(expected):
-        raise ValueError("repeatability runtime did not measure exactly the frozen subset")
+    if len(actual) != len(canonical) or set(actual) != set(expected):
+        raise ValueError("repeatability runtime did not measure exactly the frozen coordinates")
     for key, item in actual.items():
         original = expected[key]
         original_measurement = NativePointMeasurement(
@@ -418,34 +478,18 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
         if _regime(item) != _regime(original_measurement):
             raise ValueError(f"repeatability execution/seed regime changed for point {key}")
     execution = inspect_execution_evidence(cell, root / "raw", collection, plan=plan)
-    if selected["execution"]["status"] == "qualified" and execution["status"] == "qualified":
-
-        def observed_values(evidence):
-            return sorted(
-                [
-                    {
-                        key: worker[key]
-                        for key in (
-                            "dp_rank",
-                            "tp_rank",
-                            "pp_rank",
-                            "backend_version",
-                            "attention_groups",
-                            "graph_config",
-                            "resolved_config",
-                        )
-                    }
-                    for worker in evidence["observed_workers"]
-                ],
-                key=lambda worker: (worker["dp_rank"], worker["tp_rank"], worker["pp_rank"]),
-            )
-
-        if observed_values(execution) != observed_values(selected["execution"]):
-            raise ValueError("repeatability observed attention backend, graph or runtime configuration changed")
+    if selected["execution"]["status"] == execution["status"] == "qualified" and _worker_identity(
+        execution
+    ) != _worker_identity(selected["execution"]):
+        raise ValueError("repeatability observed attention backend, graph or runtime configuration changed")
     return {
+        "collector_status": entry["status"],
+        "collector_error": {key: entry[key] for key in ("error_type", "error") if key in entry},
+        "cleanup_error": entry.get("cleanup_error"),
         "attempt_id": collection.collector_attempt_id,
         "runtime_run_id": collection.runtime_run_id,
         "runtime_grid_digest": collection.runtime_grid_digest,
+        "measurement": extract_measurement_evidence(root / "raw", collection),
         "points": {
             key: {
                 "wall_time_seconds": max(value for _, value in item.rank_wall_times),
@@ -461,46 +505,229 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
     }
 
 
+def _record_sample_evidence(plan, selected, directory, frozen, report, attempt):
+    evidence = _sample_evidence(plan, selected, directory)
+    used_attempts = {cell["source_attempt_id"] for cell in frozen["cells"]}
+    used_runs = {cell["source_runtime_run_id"] for cell in frozen["cells"]}
+    for entries in report["samples"].values():
+        for entry in entries:
+            for prior in entry["attempts"]:
+                if prior.get("evidence"):
+                    used_attempts.add(prior["evidence"]["attempt_id"])
+                    used_runs.add(prior["evidence"]["runtime_run_id"])
+    if evidence["runtime_run_id"] in used_runs:
+        raise ValueError("repeatability reused a runtime run instead of an independent launch")
+    if evidence["attempt_id"] in used_attempts:
+        raise ValueError("repeatability reused a collector attempt instead of an independent launch")
+    attempt["evidence"] = evidence
+    if evidence["execution"]["status"] == "failed":
+        attempt.update(
+            status="failed",
+            failure_kind="validation_failed",
+            error="runtime execution evidence contradicts the frozen source",
+        )
+    elif evidence["collector_status"] == "cleanup_failed" or evidence["cleanup_error"] is not None:
+        attempt.update(status="failed", failure_kind="cleanup_failed", error=evidence["cleanup_error"])
+    elif evidence["collector_status"] in FPM_RECOVERABLE_STATUSES:
+        attempt.update(
+            status="failed",
+            failure_kind="postprocessing_failed",
+            error="complete native measurement retained; CPU-only post-processing recovery is required before "
+            "qualification or further launches; GPU replacement is disabled",
+        )
+    elif not attempt.get("errors"):
+        attempt["status"] = "passed"
+
+
+def _retry_sample_cleanup(plan, selected, directory, attempt):
+    """Retry teardown alone, preserving the original measurement and checkpoint."""
+    cell_root = directory / "artifacts" / plan.sha256[:16] / "cells" / selected["cell_id"]
+    cleanup = {"status": "running"}
+    attempt.setdefault("cleanup_attempts", []).append(cleanup)
+    try:
+        manifest = cell_root / FPM_MANIFEST_FILENAME
+        if not manifest.is_file():
+            raise ValueError("repeatability sample has no manifest to verify cleanup")
+        _cell_runner(plan, plan.cells[0], manifest, cell_root).cleanup()
+        if _sample_evidence(plan, selected, directory) != attempt["evidence"]:
+            raise ValueError("repeatability sample evidence changed during cleanup")
+        cleanup["status"] = "passed"
+        if attempt["evidence"]["collector_status"] in FPM_RECOVERABLE_STATUSES:
+            attempt.update(status="failed", failure_kind="postprocessing_failed")
+        else:
+            attempt["status"] = "passed"
+    except (KeyboardInterrupt, SystemExit):
+        cleanup["status"] = "interrupted"
+        raise
+    except Exception as error:
+        cleanup.update(status="failed", error=f"{type(error).__name__}: {error}")
+    finally:
+        attempt.setdefault("cleanup_file_history", []).append(attempt.get("files", {}))
+        attempt["files"] = _file_manifest(directory)
+
+
+def _retry_sample_postprocessing(plan, selected, directory, attempt):
+    """Validate salvaged artifacts without relaunching or rewriting their checkpoint."""
+    recovery = {"status": "running"}
+    attempt.setdefault("postprocessing_attempts", []).append(recovery)
+    try:
+        checkpoint = json.loads((directory / "checkpoint" / "fpm_forward.json").read_text())
+        entry = dict(checkpoint["cells"][selected["cell_id"]])
+        if attempt.get("cleanup_attempts") and attempt["cleanup_attempts"][-1]["status"] == "passed":
+            entry.pop("cleanup_error", None)
+        recovered = _recover_completed_attempt(plan, plan.cells[0], directory / "artifacts" / plan.sha256[:16], entry)
+        if recovered is None:
+            raise ValueError(
+                "CPU-only recovery could not validate the retained observation; inspect collector artifacts "
+                "and teardown before retrying recovery; the original GPU measurement cannot be replaced"
+            )
+        if _sample_evidence(plan, selected, directory) != attempt["evidence"]:
+            raise ValueError("repeatability sample evidence changed during post-processing recovery")
+        recovery.update(status="passed", artifact_recovery=recovered["artifact_recovery"])
+        attempt["status"] = "passed"
+    except (KeyboardInterrupt, SystemExit):
+        recovery["status"] = "interrupted"
+        raise
+    except Exception as error:
+        recovery.update(status="failed", error=f"{type(error).__name__}: {error}")
+    finally:
+        attempt.setdefault("postprocessing_file_history", []).append(attempt.get("files", {}))
+        attempt["files"] = _file_manifest(directory)
+
+
+def _comparison_status(comparisons: list[dict[str, Any]]) -> str:
+    if any(item["status"] == "mismatch" for item in comparisons):
+        return "mismatch"
+    if not comparisons or any(item["status"] != "comparable" for item in comparisons):
+        return "unestablished"
+    return "comparable"
+
+
 def _summarize(frozen: dict[str, Any], report: dict[str, Any]) -> None:
+    """Keep independent observations, identity eligibility and stability separate."""
     points = []
-    execution_complete = all(cell["execution"]["status"] == "qualified" for cell in frozen["cells"])
-    execution_failed = any(cell["execution"]["status"] == "failed" for cell in frozen["cells"])
-    validation_failed = False
     required = frozen["policy"]["samples"]
+    full_grid = frozen["policy"]["comparison_mode"] == "full_grid"
+    execution_failed = any(cell["execution"]["status"] == "failed" for cell in frozen["cells"])
+    execution_complete = True
+    validation_failed = False
     for cell in frozen["cells"]:
-        latest_attempts = [
-            sample["attempts"][-1] for sample in report["samples"][cell["cell_id"]] if sample["attempts"]
-        ]
-        validation_failed |= any(attempt.get("failure_kind") == "validation_failed" for attempt in latest_attempts)
-        execution_failed |= any(
-            attempt.get("evidence", {}).get("execution", {}).get("status") == "failed" for attempt in latest_attempts
+        slots = report["samples"][cell["cell_id"]]
+        latest = [sample["attempts"][-1] for sample in slots if sample["attempts"]]
+        validation_failed |= any(item.get("failure_kind") == "validation_failed" for item in latest)
+        # A valid observation is never superseded. Preserve even a completed
+        # measurement whose collection subsequently failed during teardown.
+        measured = [attempt for slot in slots for attempt in slot["attempts"] if attempt.get("evidence")]
+        execution_failed |= any(item["evidence"]["execution"]["status"] == "failed" for item in measured)
+        execution_complete &= len(measured) == required and all(
+            item["status"] == "passed" and item["evidence"]["execution"]["status"] == "qualified" for item in measured
         )
-        successful = [
-            sample["attempts"][-1]
-            for sample in report["samples"][cell["cell_id"]]
-            if sample["attempts"] and sample["attempts"][-1]["status"] == "passed"
-        ]
-        execution_complete &= len(successful) == required and all(
-            item["evidence"]["execution"]["status"] == "qualified" for item in successful
-        )
+        reference = measured[0]["evidence"].get("measurement", {}) if measured else {}
         for point in cell["points"]:
-            values = [item["evidence"]["points"][point["key"]]["wall_time_seconds"] for item in successful]
+            key = point["key"]
+            comparisons = []
+            if measured:
+                first_point = reference.get("points", {}).get(key, {})
+                first_recorded = (
+                    not reference.get("reasons")
+                    and first_point.get("status") == "recorded"
+                    and measured[0]["evidence"]["execution"]["status"] == "qualified"
+                )
+                comparisons.append(
+                    {
+                        "status": "mismatch"
+                        if measured[0]["evidence"]["execution"]["status"] == "failed"
+                        else "comparable"
+                        if first_recorded
+                        else "unestablished",
+                        "reasons": [*reference.get("reasons", []), *first_point.get("reasons", [])],
+                        "scope": "reference observation; independence checked by launch identities",
+                    }
+                )
+                for item in measured[1:]:
+                    comparison = compare_measurements(reference, item["evidence"].get("measurement", {}), point_key=key)
+                    if item["evidence"]["execution"]["status"] != "qualified":
+                        comparison = {
+                            **comparison,
+                            "status": "mismatch"
+                            if item["evidence"]["execution"]["status"] == "failed"
+                            else "unestablished",
+                            "reasons": [*comparison["reasons"], "worker execution is not qualified"],
+                        }
+                    if (
+                        measured[0]["evidence"]["execution"]["status"] == "qualified"
+                        and item["evidence"]["execution"]["status"] == "qualified"
+                        and _worker_identity(measured[0]["evidence"]["execution"])
+                        != _worker_identity(item["evidence"]["execution"])
+                    ):
+                        comparison = {
+                            **comparison,
+                            "status": "mismatch",
+                            "reasons": [*comparison["reasons"], "observed worker runtime configuration differs"],
+                        }
+                    comparisons.append(comparison)
+            comparable = _comparison_status(comparisons)
+            source_comparison = compare_measurements(
+                cell["source_measurement"], reference, point_key=key, same_context=full_grid
+            )
+            if cell["execution"]["status"] != "qualified":
+                source_comparison = {
+                    **source_comparison,
+                    "status": "mismatch" if cell["execution"]["status"] == "failed" else "unestablished",
+                    "reasons": [*source_comparison["reasons"], "source worker execution is not qualified"],
+                }
+            raw_values = [item["evidence"]["points"][key]["wall_time_seconds"] for item in measured]
+            # Raw timings remain visible even when identity cannot be established;
+            # they must not be pooled into a qualified numerical population.
+            values = raw_values if comparable == "comparable" else []
             mean = statistics.mean(values) if values else None
+            median = statistics.median(values) if values else None
             stddev = statistics.stdev(values) if len(values) >= 2 else None
             cv = stddev / mean if stddev is not None else None
             inclusive = [point["source_wall_time_seconds"], *values]
             inclusive_stddev = statistics.stdev(inclusive) if values else None
             inclusive_cv = inclusive_stddev / statistics.mean(inclusive) if inclusive_stddev is not None else None
+            difference = (
+                abs(median / point["source_wall_time_seconds"] - 1)
+                if median is not None and source_comparison["status"] == "comparable"
+                else None
+            )
+            status = (
+                "mismatch"
+                if comparable == "mismatch"
+                else "unestablished"
+                if comparable != "comparable"
+                else "incomplete"
+                if len(values) != required
+                else "passed"
+                if cv is not None and cv <= frozen["policy"]["cv_threshold"]
+                else "unstable"
+            )
             points.append(
                 {
                     "cell_id": cell["cell_id"],
                     "phase": cell["phase"],
-                    "key": point["key"],
+                    "key": key,
                     "coordinates": point["coordinates"],
                     "source_wall_time_seconds": point["source_wall_time_seconds"],
+                    "raw_samples_seconds": raw_values,
                     "samples_seconds": values,
                     "sample_count": len(values),
+                    "raw_sample_count": len(raw_values),
+                    "observations": [
+                        {
+                            "attempt_id": item["evidence"]["attempt_id"],
+                            "runtime_run_id": item["evidence"]["runtime_run_id"],
+                            "directory": item["directory"],
+                            "status": item["status"],
+                            **item["evidence"]["points"][key],
+                        }
+                        for item in measured
+                    ],
+                    "comparability": {"status": comparable, "comparisons": comparisons},
+                    "source_comparison": source_comparison,
                     "mean_seconds": mean,
+                    "median_seconds": median,
                     "minimum_seconds": min(values) if values else None,
                     "maximum_seconds": max(values) if values else None,
                     "sample_cv": cv,
@@ -508,29 +735,72 @@ def _summarize(frozen: dict[str, Any], report: dict[str, Any]) -> None:
                     "source_inclusive_cv": inclusive_cv,
                     "source_inclusive_stddev_seconds": inclusive_stddev,
                     "source_inclusive_sample_count": len(inclusive),
-                    "status": (
-                        "incomplete"
-                        if len(values) != required
+                    "source_inclusive_usage": "diagnostic_only; source is not an independent fresh repetition",
+                    "source_relative_difference": difference,
+                    "source_agreement": (
+                        "unestablished"
+                        if difference is None or len(values) != required
                         else "passed"
-                        if cv is not None
-                        and cv <= frozen["policy"]["cv_threshold"]
-                        and inclusive_cv is not None
-                        and inclusive_cv <= frozen["policy"]["cv_threshold"]
-                        else "unstable"
+                        if difference <= frozen["policy"]["source_agreement_threshold"]
+                        else "failed"
                     ),
+                    "status": status,
                 }
             )
     counts = Counter(item["status"] for item in points)
-    repeatability = "unstable" if counts["unstable"] else "incomplete" if counts["incomplete"] else "passed"
+    repeatability = (
+        "unstable"
+        if counts["unstable"]
+        else "mismatch"
+        if counts["mismatch"]
+        else "unestablished"
+        if counts["unestablished"]
+        else "incomplete"
+        if counts["incomplete"]
+        else "passed"
+    )
+    new_status = (
+        "unstable"
+        if repeatability == "unstable"
+        else "failed"
+        if execution_failed or validation_failed or counts["mismatch"]
+        else "qualified"
+        if repeatability == "passed" and execution_complete
+        else "unestablished"
+        if repeatability == "unestablished"
+        else "incomplete"
+    )
+    source_status = (
+        "failed"
+        if any(
+            point["source_comparison"]["status"] == "mismatch" or point["source_agreement"] == "failed"
+            for point in points
+        )
+        else "qualified"
+        if full_grid
+        and new_status == "qualified"
+        and all(
+            point["source_comparison"]["status"] == "comparable" and point["source_agreement"] == "passed"
+            for point in points
+        )
+        else "unestablished"
+    )
     report.update(
         points=points,
         repeatability={
             "status": repeatability,
             "cv_threshold": frozen["policy"]["cv_threshold"],
             "point_counts": dict(counts),
-            "measurement_count": "requested independent new measurements plus the original published measurement",
+            "measurement_count": "independent fresh launches; adjacent internal steps are not repetitions",
             "time_unit": "seconds",
             "standard_deviation_denominator": "n - 1",
+        },
+        new_population={"status": new_status, "scope": "full_native_sweep" if full_grid else "bounded_diagnostic"},
+        source_qualification={
+            "status": source_status,
+            "source_agreement_threshold": frozen["policy"]["source_agreement_threshold"],
+            "agreement_metric": "abs(fresh_median / source_wall_time - 1)",
+            "scope": "original_source" if full_grid else "bounded_subset_cannot_qualify_full_source",
         },
         execution={
             "status": "failed"
@@ -539,15 +809,65 @@ def _summarize(frozen: dict[str, Any], report: dict[str, Any]) -> None:
             if execution_complete
             else "incomplete"
         },
-        status="failed"
-        if execution_failed or validation_failed or repeatability == "unstable"
-        else "passed"
-        if repeatability == "passed" and execution_complete
-        else "incomplete",
+        status=(
+            "failed"
+            if new_status in {"failed", "unstable"} or source_status == "failed"
+            else "passed"
+            if new_status == source_status == "qualified"
+            else "incomplete"
+        ),
     )
 
 
-def assess_repeatability(frozen_plan: dict[str, Any], report: dict[str, Any], *, cv_threshold: float) -> dict[str, Any]:
+def _save_report(root: Path, report: dict[str, Any]) -> None:
+    """Publish an auditable derived estimate without replacing formal source data."""
+    aggregate = {
+        "schema_name": "aisimulate_fpm_repeatability_aggregate",
+        "schema_version": 1,
+        "plan_sha256": report["plan_sha256"],
+        "status": report["new_population"]["status"],
+        "scope": report["new_population"]["scope"],
+        "method": "median_of_independent_launch_max_rank_estimates",
+        "formal_source_replaced": False,
+        "points": [
+            {
+                key: point[key]
+                for key in (
+                    "cell_id",
+                    "phase",
+                    "key",
+                    "coordinates",
+                    "median_seconds",
+                    "samples_seconds",
+                    "raw_samples_seconds",
+                    "sample_cv",
+                    "status",
+                    "comparability",
+                    "observations",
+                )
+            }
+            for point in report["points"]
+        ],
+    }
+    # The durable report must keep referencing its previous immutable aggregate
+    # until the new report is committed. An interruption cannot orphan its hash.
+    aggregate_path = root / f"{Path(AGGREGATE_FILENAME).stem}-{_canonical_hash(aggregate)}.json"
+    if aggregate_path.exists():
+        if json.loads(aggregate_path.read_text()) != aggregate:
+            raise ValueError("repeatability aggregate generation changed")
+    else:
+        _atomic_json(aggregate_path, aggregate)
+    report["aggregate"] = file_evidence(aggregate_path)
+    _atomic_json(root / REPORT_FILENAME, report)
+
+
+def assess_repeatability(
+    frozen_plan: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    cv_threshold: float,
+    source_agreement_threshold: float | None = None,
+) -> dict[str, Any]:
     """Reassess preserved samples without scheduling any additional collection.
 
     The returned assessment records the original frozen plan and the changed
@@ -558,6 +878,13 @@ def assess_repeatability(frozen_plan: dict[str, Any], report: dict[str, Any], *,
         raise ValueError("repeatability cv_threshold must be finite and nonnegative")
     if report.get("plan_sha256") != frozen_plan.get("sha256"):
         raise ValueError("repeatability report does not match its frozen plan")
+    payload = {key: value for key, value in frozen_plan.items() if key != "sha256"}
+    if _canonical_hash(payload) != frozen_plan.get("sha256"):
+        raise ValueError("repeatability frozen plan hash changed")
+    if frozen_plan.get("schema_version") == 1:
+        return _assess_legacy(frozen_plan, report, cv_threshold=cv_threshold)
+    if frozen_plan.get("schema_version") != 2 or report.get("schema_version") != 2:
+        raise ValueError("unsupported repeatability evidence schema")
     source = load_repeatability_source(frozen_plan["source_campaign_dir"])
     fresh = freeze_repeatability_plan(
         source,
@@ -571,12 +898,58 @@ def assess_repeatability(frozen_plan: dict[str, Any], report: dict[str, Any], *,
     result = copy.deepcopy(report)
     assessment_plan = copy.deepcopy(frozen_plan)
     assessment_plan["policy"]["cv_threshold"] = cv_threshold
-    result["assessment"] = {"source_report_sha256": _canonical_hash(report), "cv_threshold": cv_threshold}
+    if source_agreement_threshold is not None:
+        if (
+            type(source_agreement_threshold) not in (int, float)
+            or not math.isfinite(source_agreement_threshold)
+            or source_agreement_threshold < 0
+        ):
+            raise ValueError("repeatability source_agreement_threshold must be finite and nonnegative")
+        assessment_plan["policy"]["source_agreement_threshold"] = source_agreement_threshold
+    result["assessment"] = {
+        "source_report_sha256": _canonical_hash(report),
+        "cv_threshold": cv_threshold,
+        "source_agreement_threshold": assessment_plan["policy"]["source_agreement_threshold"],
+    }
     _summarize(assessment_plan, result)
     return result
 
 
+def _assess_legacy(frozen, report, *, cv_threshold):
+    """Keep historical bounded reports inspectable without a protocol upgrade."""
+    root = Path(frozen["source_campaign_dir"]).resolve()
+    if file_evidence(Path(frozen["source_checkpoint"]["path"])) != frozen["source_checkpoint"]:
+        raise ValueError("repeatability historical source checkpoint changed")
+    for cell in frozen["cells"]:
+        if _file_manifest(root / "cells" / cell["cell_id"] / "raw") != cell["source_files"]:
+            raise ValueError("repeatability historical source artifacts changed")
+    output = Path(report["output_dir"]).resolve()
+    for samples in report["samples"].values():
+        for sample in samples:
+            for attempt in sample["attempts"]:
+                path = (output / attempt["directory"]).resolve()
+                if not path.is_relative_to(output) or _file_manifest(path) != attempt.get("files"):
+                    raise ValueError("repeatability historical sample artifacts changed")
+    result = copy.deepcopy(report)
+    result["historical_assessment"] = {
+        key: report[key] for key in ("status", "repeatability", "execution") if key in report
+    }
+    result["assessment"] = {
+        "source_report_sha256": _canonical_hash(report),
+        "cv_threshold": cv_threshold,
+        "reason": "legacy bounded measurements lack a frozen comparable protocol",
+    }
+    result["status"] = "incomplete"
+    result["source_qualification"] = {"status": "unestablished"}
+    result["new_population"] = {"status": "unestablished", "scope": "legacy_diagnostic"}
+    return result
+
+
 def _validate_saved_samples(source, frozen, report, root):
+    if report.get("schema_version") != 2:
+        raise ValueError("legacy repeatability evidence cannot resume execution; preserve it for offline inspection")
+    if report.get("aggregate") and file_evidence(Path(report["aggregate"]["path"])) != report["aggregate"]:
+        raise ValueError("repeatability aggregate artifact changed")
     if report.get("output_dir") != str(root):
         raise ValueError("repeatability report output directory changed")
     if report.get("policy") != frozen["policy"]:
@@ -585,14 +958,17 @@ def _validate_saved_samples(source, frozen, report, root):
     if set(report.get("samples", {})) != expected_cells:
         raise ValueError("repeatability saved sample cells do not match the plan")
     seen_attempts = {cell["source_attempt_id"] for cell in frozen["cells"]}
+    seen_runs = {cell["source_runtime_run_id"] for cell in frozen["cells"]}
     for cell in frozen["cells"]:
         samples = report["samples"][cell["cell_id"]]
         if len(samples) != frozen["policy"]["samples"]:
             raise ValueError("repeatability saved sample count changed")
-        plan = _subset_plan(source, cell)
+        plan = _subset_plan(source, cell, comparison_mode=frozen["policy"]["comparison_mode"])
         for index, sample in enumerate(samples, start=1):
             if sample.get("sample_index") != index or not isinstance(sample.get("attempts"), list):
                 raise ValueError("repeatability saved sample indices are invalid")
+            if len(sample["attempts"]) > frozen["policy"]["max_attempts_per_sample"]:
+                raise ValueError("repeatability saved attempts exceed the frozen retry budget")
             for attempt_index, attempt in enumerate(sample["attempts"], start=1):
                 relative = Path("samples") / cell["cell_id"] / f"sample-{index:02d}" / f"attempt-{attempt_index:02d}"
                 directory = root / relative
@@ -602,16 +978,34 @@ def _validate_saved_samples(source, frozen, report, root):
                     raise ValueError("repeatability saved attempt status is invalid")
                 if attempt.get("files") is not None and _file_manifest(directory) != attempt["files"]:
                     raise ValueError("repeatability attempt files changed")
-                if attempt["status"] != "passed":
+                if attempt["status"] != "passed" and not attempt.get("evidence"):
                     continue
                 if attempt_index != len(sample["attempts"]):
-                    raise ValueError("repeatability successful attempt was superseded")
+                    raise ValueError("repeatability valid measurement was superseded")
                 evidence = _sample_evidence(plan, cell, directory)
                 if evidence != attempt.get("evidence"):
                     raise ValueError("saved repeatability sample evidence changed")
+                if (
+                    attempt["status"] == "passed"
+                    and (evidence["collector_status"] == "cleanup_failed" or evidence["cleanup_error"] is not None)
+                    and not (attempt.get("cleanup_attempts") and attempt["cleanup_attempts"][-1]["status"] == "passed")
+                ):
+                    raise ValueError("repeatability sample cleanup is not resolved")
+                if (
+                    attempt["status"] == "passed"
+                    and evidence["collector_status"] in FPM_RECOVERABLE_STATUSES
+                    and not (
+                        attempt.get("postprocessing_attempts")
+                        and attempt["postprocessing_attempts"][-1]["status"] == "passed"
+                    )
+                ):
+                    raise ValueError("repeatability sample post-processing is not resolved")
                 if evidence["attempt_id"] in seen_attempts:
                     raise ValueError("repeatability reused an attempt instead of an independent launch")
+                if evidence["runtime_run_id"] in seen_runs:
+                    raise ValueError("repeatability reused a runtime run instead of an independent launch")
                 seen_attempts.add(evidence["attempt_id"])
+                seen_runs.add(evidence["runtime_run_id"])
 
 
 def run_repeatability(
@@ -626,8 +1020,11 @@ def run_repeatability(
     samples: int = 5,
     max_points_per_cell: int = 12,
     cv_threshold: float = 0.05,
+    comparison_mode: str = "full_grid",
+    max_attempts_per_sample: int = 2,
+    source_agreement_threshold: float = 0.05,
 ) -> dict[str, Any]:
-    """Remeasure only the frozen subset; retain separate raw data for every attempt.
+    """Repeat the original sweep, or collect an explicitly diagnostic bounded subset.
 
     The caller owns execution authorization and an allocation for the selected
     Kubernetes or Slurm transport. No serving data or formal table is replaced.
@@ -643,6 +1040,9 @@ def run_repeatability(
         samples=samples,
         max_points_per_cell=max_points_per_cell,
         cv_threshold=cv_threshold,
+        comparison_mode=comparison_mode,
+        max_attempts_per_sample=max_attempts_per_sample,
+        source_agreement_threshold=source_agreement_threshold,
     )
     root = Path(output_dir).expanduser().resolve()
     source = Path(source_campaign_dir).expanduser().resolve()
@@ -665,7 +1065,7 @@ def run_repeatability(
         _atomic_json(root / PLAN_FILENAME, frozen)
         report = {
             "schema_name": "aisimulate_fpm_repeatability",
-            "schema_version": 1,
+            "schema_version": 2,
             "plan_sha256": frozen["sha256"],
             "source_plan_sha256": source_plan.sha256,
             "output_dir": str(root),
@@ -676,22 +1076,54 @@ def run_repeatability(
             },
         }
         _summarize(frozen, report)
-        _atomic_json(root / REPORT_FILENAME, report)
+        _save_report(root, report)
     if any(cell["execution"]["status"] == "failed" for cell in frozen["cells"]):
         # A stable repeat set cannot qualify a measured wrong-source campaign.
         # Retain its assessment without spending another benchmark launch.
         _atomic_json(root / REPORT_FILENAME, report)
         return report
     for selected in frozen["cells"]:
-        plan = _subset_plan(source_plan, selected)
+        plan = _subset_plan(source_plan, selected, comparison_mode=comparison_mode)
         for sample in report["samples"][selected["cell_id"]]:
             previous = sample["attempts"][-1] if sample["attempts"] else None
             if previous is not None:
                 previous_dir = root / previous["directory"]
+                if previous["status"] != "passed" and not previous.get("evidence"):
+                    # Collection can finish before the final report is committed.
+                    # Recover its verified observation without launching a replacement.
+                    try:
+                        _record_sample_evidence(plan, selected, previous_dir, frozen, report, previous)
+                    except (FileNotFoundError, _IncompleteSample):
+                        pass
+                    except ValueError as error:
+                        previous.update(status="failed", failure_kind="validation_failed", error=str(error))
+                    previous["files"] = _file_manifest(previous_dir)
+                    _summarize(frozen, report)
+                    _save_report(root, report)
                 if previous["status"] == "passed":
                     continue
+                if previous.get("evidence"):
+                    if retry_failed and previous.get("failure_kind") == "cleanup_failed":
+                        try:
+                            _retry_sample_cleanup(plan, selected, previous_dir, previous)
+                        finally:
+                            _summarize(frozen, report)
+                            _save_report(root, report)
+                        if previous["status"] == "passed":
+                            continue
+                    if retry_failed and previous.get("failure_kind") == "postprocessing_failed":
+                        try:
+                            _retry_sample_postprocessing(plan, selected, previous_dir, previous)
+                        finally:
+                            _summarize(frozen, report)
+                            _save_report(root, report)
+                        if previous["status"] == "passed":
+                            continue
+                    return report
                 if not retry_failed:
                     return report
+                if len(sample["attempts"]) >= max_attempts_per_sample:
+                    raise ValueError("repeatability frozen retry budget exhausted; retain attempts and investigate")
                 # A failed teardown must be resolved before any next launch.
                 manifest = (
                     previous_dir
@@ -740,28 +1172,8 @@ def run_repeatability(
                 )
                 if errors:
                     attempt.update(status="failed", errors=errors, failure_kind="collection_error")
-                else:
-                    validating = True
-                    evidence = _sample_evidence(plan, selected, directory)
-                    used_attempts = {cell["source_attempt_id"] for cell in frozen["cells"]}
-                    used_attempts.update(
-                        prior["evidence"]["attempt_id"]
-                        for entries in report["samples"].values()
-                        for entry in entries
-                        for prior in entry["attempts"]
-                        if prior.get("evidence")
-                    )
-                    if evidence["attempt_id"] in used_attempts:
-                        raise ValueError("repeatability reused a collector attempt instead of an independent launch")
-                    if evidence["execution"]["status"] == "failed":
-                        attempt.update(
-                            status="failed",
-                            evidence=evidence,
-                            failure_kind="validation_failed",
-                            error="runtime execution evidence contradicts the frozen source",
-                        )
-                    else:
-                        attempt.update(status="passed", evidence=evidence)
+                validating = True
+                _record_sample_evidence(plan, selected, directory, frozen, report, attempt)
             except (KeyboardInterrupt, SystemExit):
                 attempt.update(status="interrupted", failure_kind="interrupted")
                 raise
@@ -777,11 +1189,15 @@ def run_repeatability(
             finally:
                 attempt["files"] = _file_manifest(directory)
                 _summarize(frozen, report)
-                _atomic_json(root / REPORT_FILENAME, report)
-            if attempt["status"] != "passed":
+                _save_report(root, report)
+            if (
+                attempt["status"] != "passed"
+                or report["repeatability"]["status"] == "mismatch"
+                or report["source_qualification"]["status"] == "failed"
+            ):
                 # Keep failures visible. Do not launch the remaining subset
                 # repetitions into an uninvestigated runtime/cleanup failure.
                 return report
     _summarize(frozen, report)
-    _atomic_json(root / REPORT_FILENAME, report)
+    _save_report(root, report)
     return report

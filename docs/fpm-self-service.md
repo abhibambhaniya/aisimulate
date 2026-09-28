@@ -116,7 +116,7 @@ Follow the [orchestration and recovery procedure](#orchestrate-independent-colle
 
 For both reused and new data, [inspect the published pair](../python/aisimulate/docs/fpm/end-to-end-workflow.md#5-inspect-the-published-pair): verify hashes, schema and identities, including actual runtime, topology, precision and available prefill/decode cells. Keep it at the generated configs' local systems path. Record any historical checkpoint-revision uncertainty in provenance; a declared revision does not prove that old measurements used it. A successful preview or smoke run is not formal data, and a matching pair does not prove all simulated queries are covered.
 
-Run the standard [collection quality checks](#validate-collection-and-serving-accuracy) against the original collection directory: point validity and effective execution inspection, bounded repeatability, and withheld-coordinate interpolation. Review and save the editable policy before measurements. A published table is usable evidence even when a quality gate is incomplete or failed, but it is not qualified accuracy evidence.
+Run the standard [collection quality checks](#validate-collection-and-serving-accuracy) against the original collection directory: point validity and effective execution inspection, comparable full-grid repeatability, and withheld-coordinate interpolation. Review and save the editable policy before measurements. A published table is usable evidence even when a quality gate is incomplete or failed, but it is not qualified accuracy evidence.
 
 Then, for a pending profile, [finalize runtime memory](#finalize-runtime-memory) into a fresh directory. Review and accept the resolved profile separately, save its provenance in the session checkpoint, then use that directory in stage 6. Matching timing data alone cannot finalize memory when initialization evidence is missing. Exploratory prediction/recommendation remains available with resolved memory while accuracy is unqualified.
 
@@ -982,17 +982,20 @@ Resuming `onboarding-checkpoint.json` restores the onboarding conversation and a
 
 ## Validate collection and serving accuracy
 
-The standard procedure has four distinct checks. Collection validity verifies each native point and its published row, plus observed attention groups, initialized graph configuration and KV initialization regime. Repeatability checks a small subset of the actual runtime grid. Withheld-coordinate validation checks native direct interpolation against measurements excluded from its input table. Matched serving checks the selected workload separately. Fixed weight/KV precision, a complete grid, a measured-point lookup or successful replay alone cannot establish accuracy.
+The standard procedure has four distinct checks. Collection validity verifies each native point and its published row, plus observed attention groups, initialized graph configuration and KV initialization regime. Repeatability checks independent repetitions of the complete native grid under the same frozen execution protocol. Bounded subsets remain diagnostics until their agreement with full-grid execution is established. Withheld-coordinate validation checks native direct interpolation against measurements excluded from its input table. Matched serving checks the selected workload separately. Fixed weight/KV precision, a complete grid, a measured-point lookup or successful replay alone cannot establish accuracy.
 
 Use separate validation directories for each precision/topology campaign. The original request, collection plan, raw results and formal pair remain unchanged. Save the following JSON as `validation-policy.json`, or supply equivalent YAML; omitted fields use these defaults and unknown fields are rejected:
 
 ```json
 {
-  "schema_version": "aisimulate-onboarding-validation-policy/v1",
+  "schema_version": "aisimulate-onboarding-validation-policy/v2",
   "repeatability": {
+    "comparison_mode": "full_grid",
     "samples": 5,
     "max_points_per_cell": 12,
-    "max_cv": 0.05
+    "max_attempts_per_sample": 2,
+    "max_cv": 0.05,
+    "max_source_relative_difference": 0.05
   },
   "interpolation": {
     "max_points_per_phase": 16,
@@ -1011,9 +1014,12 @@ Use separate validation directories for each precision/topology campaign. The or
 
 | Property | Meaning |
 | --- | --- |
-| `repeatability.samples` | Fresh, independently launched measurements per selected coordinate, at least 2. The source measurement is retained separately. |
-| `repeatability.max_points_per_cell` | Maximum representative coordinates per phase cell, at least 1. An insufficient budget that drops required observed strata is rejected. |
-| `repeatability.max_cv` | Maximum sample standard deviation divided by sample mean. Both fresh-sample CV and CV including the published source sample must pass. |
+| `repeatability.comparison_mode` | `full_grid` repeats the source native sweep with fresh engines. `bounded` selects a diagnostic subset and cannot qualify the full-grid source. |
+| `repeatability.samples` | Fresh, independently launched measurements per coordinate, at least 2. The source measurement is retained separately. |
+| `repeatability.max_points_per_cell` | In `bounded` mode only, maximum representative coordinates per phase cell, at least 1. A budget that drops required observed strata is rejected. |
+| `repeatability.max_attempts_per_sample` | Total attempts permitted per independent sample, including the first launch. Failed attempts and valid slow measurements remain recorded. |
+| `repeatability.max_cv` | Maximum sample standard deviation divided by sample mean across all valid independent estimates in a comparable population. Adjacent internal decode steps are not independent samples. |
+| `repeatability.max_source_relative_difference` | Maximum `abs(fresh median - source) / source` at each coordinate. Applies only when source and fresh full-grid evidence are comparable; distinct from CV. |
 | `interpolation.max_points_per_phase` | Maximum withheld coordinates for each phase, at least 1; selection retains boundary anchors and a viable retained measurement table. |
 | `interpolation.seed` | Nonnegative deterministic selection seed. |
 | `interpolation.max_p95_relative_error` | Maximum p95 absolute relative forward-time error, separately for prefill and decode. |
@@ -1027,7 +1033,7 @@ Ratios are dimensionless: `0.20` means 20%. Error is `abs(predicted - measured) 
 
 ### Stage 5: collection quality
 
-Freeze the policy and native subset, inspect source validity/execution and run the CPU holdout evaluator:
+Freeze the policy and native grid, inspect source validity/execution and run the CPU holdout evaluator:
 
 ```bash
 aisimulate onboard validate-collection \
@@ -1047,9 +1053,15 @@ aisimulate onboard validate-collection \
   --resume --execute
 ```
 
-The subset covers observed small/large batches, short/long KV contexts and selected graph boundaries. Each fresh sample is an isolated native explicit-manifest run through the existing executor, with separate raw artifacts and attempt IDs. Dynamo still admits and measures the points; repeated results do not replace the formal table. Global warm-up and KV preparation remain outside measured forward time. Inspect individual samples, counts, mean, minimum/maximum, sample standard deviation in seconds (`sample_stddev_seconds` and `source_inclusive_stddev_seconds`), and both CV values in `repeatability-assessment.json`. A published outlier cannot pass merely because five new measurements agree with each other. Failed attempts remain recorded; add `--retry-failed` when explicitly resuming them.
+Each full-grid repetition launches a fresh engine through the existing executor with the source collection options and separate raw artifacts, attempt IDs and runtime run IDs. Dynamo still determines and admits the native points. Repetitions preserve the source seed, warm-up, KV preparation, runtime/graph settings and allocation policy; changing those settings requires a fresh source campaign. Global warm-up and KV preparation remain outside measured forward time. The per-launch estimate remains the maximum across ranks, followed by a median across independent launches. The derived aggregate is separate evidence and never overwrites the formal table.
 
-The source must retain a schema-v11 collector plan, successful cell attempts, formal publication and archived `generator-overrides.json`. New GPU launches require the source collector revision; a different checkout must not silently remeasure old data under new behavior. Historical artifacts remain readable but missing observations or deployment evidence prevent qualification. Effective execution inspection records initialized backend/graph settings and point KV regimes; it does not claim a per-point CUDA graph dispatch trace.
+Comparability is checked before numeric stability: inspect the per-rank injected-prompt hashes, runtime pins, expected graph/capture and KV regimes, preparation settings and native sweep history. Compare the same DP rank across launches; different ranks may legitimately use different prompts. Missing or mismatched evidence is reported explicitly. Prompt hashes do not observe sampled continuation tokens, KV/recurrent-state tensors or prove execution-history equivalence. A valid slow measurement remains part of its population; latency alone is not a reason to declare it incomparable.
+
+Inspect individual attempts and raw internal samples, the median, sample count, mean, minimum/maximum, sample standard deviation and CV in `repeatability-assessment.json`. CV uses every valid independent estimate in the comparable population, including slow samples. Adjacent decode steps and consolidated provenance duplicates never count as independent launches. The source-inclusive CV is retained as a diagnostic, not blindly pooled into the fresh population. Qualification of the published source additionally requires comparable full-grid evidence and source-versus-median agreement within `max_source_relative_difference`; stable new measurements cannot qualify an incomparable or outlying historical source. Keep the default 5% CV bound while investigating instability.
+
+For a bounded diagnostic, set `comparison_mode` to `bounded` in a new policy and use a fresh output directory. Its subset covers small/large batches, short/long KV contexts and selected graph boundaries, but executes a different sweep history. It cannot pass the full-grid quality gate even if its own measurements are stable. Preserve both populations and establish their empirical agreement before considering a different validation protocol. Failed attempts remain recorded; `--retry-failed` requires explicit resume and stays within the frozen `max_attempts_per_sample` budget. A successful slow sample is never replaced by a faster retry.
+
+The source must retain a schema-v11 collector plan, successful cell attempts, formal publication and archived `generator-overrides.json`. New GPU launches require the source collector revision; a different checkout must not silently remeasure old data under new behavior. Historical artifacts remain readable but missing observations, measurement-protocol metadata or deployment evidence prevent qualification. Explicit policy v1 retains its bounded-subset meaning and cannot qualify under v2; preserve its frozen outputs and use a fresh validation directory for the new protocol. Never upgrade a saved v1 policy or old result in place. Effective execution inspection records initialized backend/graph settings and point KV regimes; it does not claim a per-point CUDA graph dispatch trace.
 
 For a source with a frozen Slurm CPU policy, repeats retain that exact node-task CPU request and binding. Review CPU affinity evidence for each fresh attempt alongside the timing spread; adequate requested CPUs alone do not establish the worker and scheduler masks. A changed CPU policy is a new collection experiment, not a repeat of the old launch.
 
@@ -1068,7 +1080,7 @@ aisimulate onboard validate-collection \
   --repeatability-dir ./collection-quality/repeatability
 ```
 
-Raw samples and source collection are revalidated before reuse. A different repeat count or subset budget requires new measurements; a changed holdout selection can reuse the formal table and rerun CPU evaluation. `--resume` requires unchanged policy, source evidence and holdout selection version. Assessments created before execution-boundary retention require a fresh validation output directory; keep their original failures and reports. The revised selection evaluates a narrower scope, so a changed result is not proof that core interpolation or serving accuracy improved. Preserve prior assessments rather than editing their saved policy or status fields.
+Raw samples and source collection are revalidated before reuse. A changed repeat count, comparison mode, bounded subset budget or attempt budget requires a fresh measurement campaign; a changed holdout selection can reuse the formal table and rerun CPU evaluation. `--resume` requires unchanged policy, source evidence and holdout selection version. Threshold-only reassessment preserves the original numerical result and all raw attempts; changing a threshold is an explicit policy decision, not a retry strategy. Assessments created before execution-boundary retention require a fresh validation output directory; keep their original failures and reports. The revised selection evaluates a narrower scope, so a changed result is not proof that core interpolation or serving accuracy improved. Preserve prior assessments rather than editing their saved policy or status fields.
 
 ### Stage 6: matched serving
 
@@ -1140,6 +1152,13 @@ Use the existing single checkpoint and its revision checks. Add validation-only 
     "tp4": {
       "validation_inputs": {
         "policy": "/absolute/path/collection-quality/policy.json",
+        "repeatability": {
+          "comparison_mode": "full_grid",
+          "samples": 5,
+          "max_attempts_per_sample": 2,
+          "max_cv": 0.05,
+          "max_source_relative_difference": 0.05
+        },
         "trace": "/absolute/path/selected-play.jsonl"
       },
       "artifacts": {
@@ -1152,7 +1171,7 @@ Use the existing single checkpoint and its revision checks. Add validation-only 
 }
 ```
 
-Apply it with `aisimulate onboard checkpoint --file PATH --expect-revision CURRENT --update PATCH.json`. Archive superseded validation references with a reason and register replacement paths, as in the [checkpoint workflow](#checkpoint-and-resume-an-onboarding-session). Policy/trace edits invalidate assessments, not accepted profiles or valid collected data. After resuming a partial repeatability run, replace its changed report reference before recording completion. Saved stage labels never substitute for rechecking machine evidence.
+Apply it with `aisimulate onboard checkpoint --file PATH --expect-revision CURRENT --update PATCH.json`. Archive superseded validation references with a reason and register replacement paths, as in the [checkpoint workflow](#checkpoint-and-resume-an-onboarding-session). Policy/trace edits invalidate assessments, not accepted profiles or valid collected data. Save the frozen repeatability policy, source protocol/seed/preparation and selected coordinates before execution; the checkpoint records context and does not execute or apply these settings. After resuming a partial repeatability run, replace its changed report reference before recording completion. Saved stage labels never substitute for rechecking machine evidence.
 
 ## Validate FPM query coverage with AgentX replay
 

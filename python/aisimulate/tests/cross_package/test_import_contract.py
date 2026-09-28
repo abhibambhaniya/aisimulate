@@ -184,11 +184,14 @@ def test_fpm_profile_alias_instances_load_and_compile(namespace: str, tmp_path: 
     from aisimulate_core.sdk import engine
     from aisimulate_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
 
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"architectures": ["ImportContractDecoderForCausalLM"]}))
     alias = importlib.import_module(f"{namespace}.fpm_profile")
     profile = alias.FpmModelProfile.model_validate(
         {
             "schema_version": 1,
-            "model": "test/unknown-decoder",
+            "model": str(checkpoint),
             "model_revision": "import-contract-fixture-v1",
             "architecture": "ImportContractDecoderForCausalLM",
             "context_length": 4096,

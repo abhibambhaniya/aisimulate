@@ -832,8 +832,6 @@ impl FpmForwardOp {
     }
 }
 
-/// Exact lookup or raw linear interpolation strictly inside one measured
-/// curve. There is deliberately no callback, boundary hold, or SOL input.
 fn fpm_coordinates(phase: FpmPhase, coords: &[f64]) -> FpmCoordinates {
     FpmCoordinates {
         batch_size: coords[0],
@@ -879,6 +877,8 @@ fn direct_curve_support(
     ]
 }
 
+/// Exact lookup or raw linear interpolation strictly inside one measured
+/// curve. There is deliberately no callback, boundary hold, or SOL input.
 fn direct_curve_value(curve: &BTreeMap<u32, f64>, coordinate: f64) -> Option<f64> {
     if !coordinate.is_finite() || coordinate < 0.0 || coordinate > u32::MAX as f64 {
         return None;

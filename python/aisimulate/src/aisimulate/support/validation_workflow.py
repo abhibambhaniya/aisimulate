@@ -162,7 +162,11 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
     """Verify formal publication against every native row before qualification."""
     import pyarrow.parquet as pq
     from collector.fpm_forward.config import PrefillSamplingProfile
-    from collector.fpm_forward.database import aggregate_cell, validate_formal_database_commit
+    from collector.fpm_forward.database import (
+        aggregate_cell,
+        published_dense_synthetic_cells,
+        validate_formal_database_commit,
+    )
     from collector.fpm_forward.planner import backend_identity_columns
     from collector.fpm_forward.repeatability import load_repeatability_source
 
@@ -220,7 +224,8 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
     parquet, metadata = (Path(database[name]).resolve() for name in ("parquet", "metadata"))
     if any(not path.is_relative_to(root / "systems/data") for path in (parquet, metadata)):
         raise ValueError("formal data must belong to this source campaign")
-    validate_formal_database_commit(parquet, metadata, plan)
+    published = validate_formal_database_commit(parquet, metadata, plan)
+    dense_cells = published_dense_synthetic_cells(published)
     rows = []
     for cell in plan.cells:
         for field in ("tp", "pp", "dp", "cp", "moe_tp", "moe_ep"):
@@ -237,7 +242,13 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
         if entry.get("status") != "passed" or not entry.get("attempt_id"):
             raise ValueError(f"source cell is not complete: {cell.cell_id}")
         rows.extend(
-            aggregate_cell(plan, cell, campaign / "cells" / cell.cell_id, expected_attempt_id=entry["attempt_id"])
+            aggregate_cell(
+                plan,
+                cell,
+                campaign / "cells" / cell.cell_id,
+                expected_attempt_id=entry["attempt_id"],
+                dense_synthetic_kv=cell.cell_id in dense_cells,
+            )
         )
     canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)
     if sorted(map(canonical, rows)) != sorted(map(canonical, pq.read_table(parquet).to_pylist())):
@@ -304,7 +315,14 @@ def _holdout(
     )
 
 
-def _repeat_plan(plan: Any, campaign: Path, checkpoint: Path, policy: ValidationPolicy) -> dict[str, Any]:
+def _repeat_plan(
+    plan: Any,
+    campaign: Path,
+    checkpoint: Path,
+    policy: ValidationPolicy,
+    *,
+    observation_evidence_version: int = 2,
+) -> dict[str, Any]:
     from collector.fpm_forward.repeatability import freeze_repeatability_plan
 
     return freeze_repeatability_plan(
@@ -317,6 +335,7 @@ def _repeat_plan(plan: Any, campaign: Path, checkpoint: Path, policy: Validation
         comparison_mode=policy.repeatability.comparison_mode,
         max_attempts_per_sample=policy.repeatability.max_attempts_per_sample,
         source_agreement_threshold=policy.repeatability.max_source_relative_difference,
+        observation_evidence_version=observation_evidence_version,
     )
 
 
@@ -363,7 +382,7 @@ def _repeatability_gate_status(assessment: dict[str, Any], policy: ValidationPol
 
 
 def validate_collection(args: argparse.Namespace) -> int:
-    from collector.fpm_forward.repeatability import load_repeatability_deployment, run_repeatability
+    from collector.fpm_forward.repeatability import PLAN_FILENAME, load_repeatability_deployment, run_repeatability
 
     request = SupportRequest.from_yaml(args.config)
     root = Path(args.output_dir).expanduser().resolve()
@@ -374,7 +393,17 @@ def validate_collection(args: argparse.Namespace) -> int:
     if args.repeatability_dir and (args.execute or args.resume):
         raise ValueError("reuse --repeatability-dir only with a fresh offline assessment")
     plan, campaign, checkpoint, formal = _collection_source(request, root)
-    frozen = _repeat_plan(plan, campaign, checkpoint, policy)
+    previous_selection = (
+        output / "repeatability-selection.json"
+        if args.resume
+        else Path(args.repeatability_dir).resolve() / PLAN_FILENAME
+        if args.repeatability_dir
+        else None
+    )
+    evidence_version = (
+        _json(previous_selection).get("observation_evidence_version", 1) if previous_selection is not None else 2
+    )
+    frozen = _repeat_plan(plan, campaign, checkpoint, policy, observation_evidence_version=evidence_version)
     holdout_evidence = _holdout_evidence(plan, campaign, frozen)
     inputs = {
         "request": _identity(Path(args.config)),
@@ -449,6 +478,7 @@ def validate_collection(args: argparse.Namespace) -> int:
             comparison_mode=policy.repeatability.comparison_mode,
             max_attempts_per_sample=policy.repeatability.max_attempts_per_sample,
             source_agreement_threshold=policy.repeatability.max_source_relative_difference,
+            observation_evidence_version=evidence_version,
         )
     if repeats.exists():
         assessment = _assess_repeats(repeats, policy, frozen)
@@ -485,13 +515,15 @@ def _compare_holdout(saved: dict[str, Any], current: dict[str, Any]) -> None:
 
 
 def check_collection_report(
-    path: Path, policy: ValidationPolicy
+    path: Path, policy: ValidationPolicy | None = None
 ) -> tuple[dict[str, Any], SupportRequest, Any, dict[str, Any]]:
     """Recompute all mandatory collection gates from preserved native/formal data."""
     report = _json(path)
     if report.get("schema_version") != "aisimulate-collection-validation/v1":
         raise ValueError("unsupported collection validation report")
     previous_policy = _policy(_checked(report["policy"]))
+    if policy is None:
+        policy = previous_policy
     if previous_policy.repeatability != policy.repeatability or previous_policy.interpolation != policy.interpolation:
         raise ValueError("collection validation policy differs; reassess with the selected policy")
     inputs = report["inputs"]
@@ -502,8 +534,15 @@ def check_collection_report(
     plan, campaign, checkpoint, formal = _collection_source(request, root)
     if formal != inputs["formal_data"]:
         raise ValueError("source formal data changed since collection validation")
-    frozen = _repeat_plan(plan, campaign, checkpoint, policy)
-    if _json(_checked(report["selection"])) != frozen:
+    saved_selection = _json(_checked(report["selection"]))
+    frozen = _repeat_plan(
+        plan,
+        campaign,
+        checkpoint,
+        policy,
+        observation_evidence_version=saved_selection.get("observation_evidence_version", 1),
+    )
+    if saved_selection != frozen:
         raise ValueError("source runtime evidence or repeatability selection changed")
     gates = report["gates"]
     expected_execution = _execution_status(frozen)
@@ -533,7 +572,13 @@ def check_collection_report(
 
 
 def _check_replay(path: Path, original: SupportRequest, collection: dict[str, Any], source_plan: Any) -> dict[str, Any]:
-    from .finalization import _merge_resources, _verify_collection, finalization_manifest, verify_finalized_data
+    from .finalization import (
+        _merge_resources,
+        _verify_collection,
+        finalization_manifest,
+        verify_finalized_data,
+        verify_finalized_quality,
+    )
     from .validation import _completion_issues, _fpm_artifacts, _prediction_config
 
     report = _json(path)
@@ -568,6 +613,9 @@ def _check_replay(path: Path, original: SupportRequest, collection: dict[str, An
             Path(collection["inputs"]["collection_directory"]),
             memory_revision=manifest.get("memory_revision"),
         )
+        quality = verify_finalized_quality(manifest)
+        if quality is not None:
+            verified_manifest["collection_quality"] = quality
         expected_resources = _merge_resources(
             observations,
             verified_manifest,

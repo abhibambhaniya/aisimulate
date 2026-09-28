@@ -33,6 +33,12 @@ def _cell_report(plan, cell, campaign: Path, entry: Any) -> dict[str, Any]:
         "raw_artifact_root": str(raw),
         "native_regime_counts": {},
         "formal_regime_counts": {},
+        "classification_scope": (
+            "formal_regime_counts and direct_eligible_points describe current reaggregation of verified native "
+            "artifacts; they do not assess or upgrade an existing published table. Existing publications keep "
+            "their saved classification. Publish revised classification to a fresh output tree and retain the "
+            "original pair."
+        ),
         "direct_eligible_points": 0,
         "coverage": "unverified",
         "rank_diagnostics": [],

@@ -630,6 +630,13 @@ def _configuration(root: Path, label: str, saved: dict[str, Any], launch: dict[s
                 if canonical_settings is None:
                     canonical_settings = settings
                 else:
+                    if settings["compilation_config"] != canonical_settings["compilation_config"]:
+                        raise ValueError(
+                            "effective runtime/graph settings across phases/ranks differ: a shared memory "
+                            "profile requires matching observed compilation and CUDA-graph captures. "
+                            "Explicit prefill captures do not configure decode; use runtime policy, "
+                            "verified matching explicit captures, or eager execution matching the serving target"
+                        )
                     _same(settings, canonical_settings, "effective runtime/graph settings across phases/ranks")
             else:
                 if dp in schedulers or record.get("tp_rank") is not None or record.get("pp_rank") is not None:

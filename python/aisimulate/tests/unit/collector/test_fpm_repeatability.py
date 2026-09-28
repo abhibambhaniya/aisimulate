@@ -21,7 +21,7 @@ from collector.fpm_forward.native_artifact import (
 from collector.fpm_forward.runtime import fpm_memory_observer as observer
 from collector.fpm_forward.runtime_memory import validate_saved_plan
 
-from .test_fpm_measurement_evidence import _add_measurement_protocol
+from .test_fpm_measurement_evidence import _add_measurement_protocol, _remove_execution_protocol
 from .test_fpm_profile_collection import _plan, _profile, no_models_or_timing_data  # noqa: F401
 from .test_fpm_runner import _native_payload, _write_provenance
 from .test_fpm_runtime_memory import _vllm_config
@@ -47,7 +47,16 @@ def _point(coordinates, phase, index):
 
 
 def _write_campaign(
-    root, checkpoint_path, plan, *, attempt_id="source", factor=1.0, observed=True, generator_overrides=None
+    root,
+    checkpoint_path,
+    plan,
+    *,
+    attempt_id="source",
+    factor=1.0,
+    observed=True,
+    generator_overrides=None,
+    native_points=None,
+    execution_evidence=True,
 ):
     deployment = generator_overrides or {}
     root.mkdir(parents=True, exist_ok=True)
@@ -67,7 +76,9 @@ def _write_campaign(
         provenance["runtime"]["backend_version"] = plan.capability.aic_database_version
         (raw / "collector-provenance.json").write_text(json.dumps(provenance))
         coords = (
-            json.loads(plan.options.benchmark_points_json)[cell.workload_kind]
+            native_points[cell.workload_kind]
+            if native_points is not None
+            else json.loads(plan.options.benchmark_points_json)[cell.workload_kind]
             if plan.options.benchmark_points_json
             else [
                 {
@@ -137,7 +148,7 @@ def _write_campaign(
                 recurrent_state={"initialization": "unchanged", "policy": None, "uniform_bound": None},
                 grid_digest=repeatability._canonical_hash(points),
             )
-            _add_measurement_protocol(payload)
+            _add_measurement_protocol(payload, execution=execution_evidence)
             (raw / f"benchmark-dp{rank}.json").write_text(json.dumps(payload))
             if observed:
                 for tp in range(cell.topology.tp):
@@ -312,7 +323,7 @@ def test_freeze_selects_validated_native_extremes_and_reports_unselected_capture
     } == {16, 1024}
     assert selected["selection_coverage"]["unselected_capture_boundaries"] == [2, 4, 8]
     assert selected["execution"]["status"] == "qualified"
-    assert selected["execution"]["per_point_dispatch"] == "unreported"
+    assert selected["execution"]["per_point_dispatch"] == "observed"
     validate_saved_plan(repeatability._subset_plan(plan, selected).to_dict())
     assert frozen == repeatability.freeze_repeatability_plan(
         plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded"
@@ -982,12 +993,13 @@ def test_repeat_changed_runtime_regime_never_enters_repeatability_statistics(cam
 
 def test_old_artifacts_without_execution_evidence_remain_incomplete(campaign):
     plan, source, checkpoint = campaign
+    _mutate_native(source, _remove_execution_protocol)
     for path in source.glob("cells/*/raw/*/fpm-execution*.json"):
         path.unlink()
     frozen = repeatability.freeze_repeatability_plan(plan, source, checkpoint)
     evidence = frozen["cells"][0]["execution"]
     assert evidence["status"] == "incomplete"
-    assert "missing" in evidence["missing_evidence"][0]
+    assert any("worker execution observations missing" in reason for reason in evidence["missing_evidence"])
 
 
 def test_execution_observer_preserves_mixed_selected_backends_and_graph_config(tmp_path, monkeypatch):

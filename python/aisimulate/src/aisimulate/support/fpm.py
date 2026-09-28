@@ -10,6 +10,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from aisimulate.fpm_advisory import prefill_graph_advisory
+
 from .schema import FPMDeployment, SupportRequest
 
 
@@ -245,6 +247,11 @@ def run_fpm(
         checkpoint_dir=checkpoint_dir,
         deployment=deployment,
     )
+    advisory = prefill_graph_advisory(
+        request.collection.prefill_cudagraph_policy, enforce_eager="--fpm-enforce-eager" in command
+    )
+    if advisory:
+        print(advisory, file=sys.stderr)
     if not execute:
         if resume or (root.exists() and any(root.iterdir())):
             check_plan(request, root)

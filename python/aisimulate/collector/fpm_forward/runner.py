@@ -90,8 +90,10 @@ _FPM_VLLM_RUNTIME_ARGS = (
 # insensitive to both flags (measured 100-108 ms across all four combinations
 # at 8192 new tokens, M2.7 tp4+EP).
 _FPM_VLLM_PREFILL_ARGS = ("--no-async-scheduling",)
-# Decode always keeps async scheduling on (vLLM's default) -- the
-# steady-state second step models a production decode iteration, and
+# Ordinary decode leaves scheduling to the runtime default. Memory observation
+# explicitly requests synchronous scheduling in both phases to establish one
+# compatible memory profile; execution evidence records the effective choice.
+# The steady-state second step models a production decode iteration, and
 # production overlaps scheduler CPU work with the GPU. Against real traffic
 # at (256, 2.1M KV): async 26.5 ms (1.03x of the 25.8 ms measured), sync
 # 31.3 ms (1.21x).

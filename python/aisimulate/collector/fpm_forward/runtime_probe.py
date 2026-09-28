@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aisimulate.fpm_advisory import prefill_graph_advisory
+
 from . import runner
 from .config import FPM_WARMUP_ITERATIONS, FPMCollectionOptions
 from .entry import _load_generator_overrides
@@ -875,6 +877,12 @@ def probe_runtime(
                 "phases": {},
                 "diagnostics": [],
             }
+            collection = plan.launch["collection"]
+            advisory = prefill_graph_advisory(
+                collection["prefill_cudagraph_policy"], enforce_eager=collection["enforce_eager"]
+            )
+            if advisory:
+                result["diagnostics"].append(advisory)
             entry = index["configurations"].setdefault(configuration, {"launch": plan.launch, "attempts": []})
             previous = entry["attempts"][-1] if entry["attempts"] else None
             if execute and resume and previous is not None:

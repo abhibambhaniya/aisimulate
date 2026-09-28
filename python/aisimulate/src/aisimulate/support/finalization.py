@@ -40,6 +40,13 @@ def add_finalization_parser(actions: Any) -> None:
         "--memory-config",
         help="Accepted capacity-only request revision imported from this collection's formal observations.",
     )
+    parser.add_argument(
+        "--collection-report",
+        help=(
+            "Collection-validation.json to independently recheck and bind to the exported profile. "
+            "Omitting it records collection quality as not_assessed; finalization does not assess serving accuracy."
+        ),
+    )
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -82,7 +89,75 @@ def finalization_manifest(request: SupportRequest) -> dict[str, Any] | None:
         return None
     if "observation_provenance" in value and value["observation_provenance"] != "source_references":
         raise ValueError("unsupported finalized observation provenance format")
+    try:
+        profile_provenance = json.loads(request.fpm_profile.provenance)
+    except ValueError:
+        profile_provenance = {}
+    profile_quality = profile_provenance.get("collection_quality") if isinstance(profile_provenance, dict) else None
+    quality = value.get("collection_quality")
+    if quality != profile_quality and (quality is not None or profile_quality != _unassessed_quality()):
+        raise ValueError("finalized profile collection quality differs from its memory manifest")
     return value
+
+
+def _unassessed_quality() -> dict[str, Any]:
+    return {"status": "not_assessed", "accuracy": "not_assessed"}
+
+
+def _collection_quality(
+    request: SupportRequest, root: Path, manifest: dict[str, Any], report_path: Path | None
+) -> dict[str, Any]:
+    """Recheck native evidence, preserving failures without making an accuracy claim."""
+    if report_path is None:
+        return _unassessed_quality()
+    from .validation_workflow import _checked, _identity, check_collection_report
+
+    reference = _identity(report_path)
+    saved = _json(report_path)
+    inputs = saved["inputs"]
+    # Establish the source before following a report into its own saved plan.
+    # A capacity-only revision does not replace this original timing request.
+    original = SupportRequest.from_yaml(_checked(inputs["request"]))
+    if original != request or Path(inputs["collection_directory"]).resolve() != root:
+        raise ValueError("collection quality report differs from the original request or collection directory")
+    report, original, plan, _ = check_collection_report(report_path)
+    if (
+        original != request
+        or request_id(original) != manifest["source_request_id"]
+        or plan.sha256 != manifest["source_collection_plan_sha256"]
+    ):
+        raise ValueError("collection quality report differs from the finalized collection identity")
+    _checked(reference)
+    return {
+        "status": report["status"],
+        "accuracy": "not_assessed",
+        "report": reference,
+        "policy": report["policy"],
+        "gates": {name: gate["status"] for name, gate in report["gates"].items()},
+    }
+
+
+def verify_finalized_quality(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Revalidate an exported assessment; absent historical markers stay absent."""
+    if "collection_quality" not in manifest:
+        return None
+    quality = manifest["collection_quality"]
+    if not isinstance(quality, dict):
+        raise ValueError("invalid finalized collection quality")
+    reference = quality.get("report")
+    if reference is None:
+        expected = _unassessed_quality()
+    else:
+        from .validation_workflow import _checked
+
+        root = Path(manifest["source_directory"]).resolve()
+        request = SupportRequest.from_yaml(root / "request.yaml")
+        if request_id(request) != manifest["source_request_id"]:
+            raise ValueError("finalized collection quality source request changed")
+        expected = _collection_quality(request, root, manifest, _checked(reference))
+    if quality != expected:
+        raise ValueError("finalized collection quality differs from verified assessment")
+    return expected
 
 
 def verify_finalized_data(request: SupportRequest, root: Path) -> None:
@@ -101,6 +176,7 @@ def verify_finalized_data(request: SupportRequest, root: Path) -> None:
         path = _inside(root / relative, root / "systems/data")
         if _digest(path.read_bytes()) != artifact.get("sha256"):
             raise ValueError(f"finalized FPM data changed: {path}")
+    verify_finalized_quality(manifest)
 
 
 def _merge_resources(
@@ -188,7 +264,11 @@ def _verify_collection(
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[Path, bytes], dict[Path, str]]:
     from collector.fpm_forward.cli import _parser
     from collector.fpm_forward.config import FPMCollectionOptions
-    from collector.fpm_forward.database import aggregate_cell, validate_formal_database_commit
+    from collector.fpm_forward.database import (
+        aggregate_cell,
+        published_dense_synthetic_cells,
+        validate_formal_database_commit,
+    )
     from collector.fpm_forward.planner import backend_identity_columns
     from collector.fpm_forward.runner import CHECKPOINT_SCHEMA
     from collector.fpm_forward.runtime_memory import (
@@ -288,7 +368,8 @@ def _verify_collection(
     metadata = _inside(Path(database["metadata"]), root / "systems/data")
     if parquet.name != "fpm_forward_perf.parquet" or metadata != parquet.with_name("fpm_forward_perf.metadata.json"):
         raise ValueError("collector checkpoint does not reference a canonical formal FPM pair")
-    validate_formal_database_commit(parquet, metadata, frozen)
+    published = validate_formal_database_commit(parquet, metadata, frozen)
+    dense_cells = published_dense_synthetic_cells(published)
     snapshots = {path: _digest(path.read_bytes()) for path in (checkpoint_path, collection_path, parquet, metadata)}
     rows, observations = [], []
     expected_topology = {
@@ -327,7 +408,11 @@ def _verify_collection(
                 raise ValueError(f"refusing symlinked collection artifact: {path}")
             if path.is_file():
                 snapshots[path] = _digest(path.read_bytes())
-        rows.extend(aggregate_cell(frozen, cell, cell_dir, expected_attempt_id=attempt))
+        rows.extend(
+            aggregate_cell(
+                frozen, cell, cell_dir, expected_attempt_id=attempt, dense_synthetic_kv=cell.cell_id in dense_cells
+            )
+        )
         if probe_manifest is None:
             observations.append(
                 resolve_runtime_resources(
@@ -411,6 +496,7 @@ def finalize(
     resolved_output_dir: str | Path,
     *,
     memory_config: str | Path | None = None,
+    collection_report: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(output_dir).expanduser().resolve()
     raw_target = Path(resolved_output_dir).expanduser()
@@ -439,6 +525,12 @@ def finalize(
         observations, manifest, formal_files, snapshots = _verify_collection(
             request, root, memory_revision=memory_revision
         )
+        manifest["collection_quality"] = _collection_quality(
+            request,
+            root,
+            manifest,
+            Path(collection_report).expanduser().resolve() if collection_report is not None else None,
+        )
         resources = _merge_resources(observations, manifest, source_references=True)
         payload = request.model_dump(mode="json")
         payload["fpm_profile"]["provenance"] = _canonical(
@@ -447,6 +539,7 @@ def finalize(
                 "method": "runtime memory resolved from verified collector artifacts",
                 "source_collection_plan_sha256": manifest["source_collection_plan_sha256"],
                 "source_profile_provenance": request.fpm_profile.provenance,
+                "collection_quality": manifest["collection_quality"],
             }
         )
         selected = request.profile_deployment()
@@ -469,6 +562,7 @@ def finalize(
                     raise ValueError(f"collection artifact changed during finalization: {path}")
             if memory_revision is not None:
                 _memory_revision_request(memory_revision)
+            verify_finalized_quality(manifest)
             if target.exists():
                 raise ValueError("resolved output appeared during finalization; refusing to replace it")
             os.rename(staging, target)
@@ -479,6 +573,8 @@ def finalize(
         "resolved_directory": str(target),
         "request": plan["outputs"]["request"],
         "review_status": "requires_review",
+        "collection_quality": manifest["collection_quality"]["status"],
+        "accuracy": "not_assessed",
     }
 
 
@@ -488,6 +584,7 @@ def run_finalization(args: argparse.Namespace) -> int:
         args.output_dir,
         args.resolved_output_dir,
         memory_config=args.memory_config,
+        collection_report=args.collection_report,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     print("Runtime memory resolved. Review the new profile before accepting it in the onboarding checkpoint.")

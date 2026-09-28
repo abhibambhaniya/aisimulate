@@ -282,8 +282,11 @@ def freeze_repeatability_plan(
     comparison_mode: str = "full_grid",
     max_attempts_per_sample: int = 2,
     source_agreement_threshold: float = 0.05,
+    observation_evidence_version: int = 2,
 ) -> dict[str, Any]:
     """Inspect validated source artifacts and return a deterministic frozen plan."""
+    if type(observation_evidence_version) is not int or observation_evidence_version not in {1, 2}:
+        raise ValueError("unsupported repeatability observation evidence version")
     if type(samples) is not int or samples < 2:
         raise ValueError("repeatability samples must be an integer >= 2")
     if type(max_points_per_cell) is not int or max_points_per_cell < 1:
@@ -339,7 +342,9 @@ def freeze_repeatability_plan(
                 "phase": cell.workload_kind,
                 "source_attempt_id": collection.collector_attempt_id,
                 "source_runtime_run_id": collection.runtime_run_id,
-                "source_measurement": extract_measurement_evidence(cell_dir / "raw", collection),
+                "source_measurement": extract_measurement_evidence(
+                    cell_dir / "raw", collection, evidence_version=observation_evidence_version
+                ),
                 "source_point_count": len(collection.points),
                 "points": selected,
                 "selection_coverage": {
@@ -355,10 +360,13 @@ def freeze_repeatability_plan(
                     name: file_evidence(cell_dir / name) if (cell_dir / name).is_file() else None
                     for name in _LAUNCH_FILES
                 },
-                "execution": inspect_execution_evidence(cell, cell_dir / "raw", collection, plan=source_plan),
+                "execution": inspect_execution_evidence(
+                    cell, cell_dir / "raw", collection, plan=source_plan, evidence_version=observation_evidence_version
+                ),
             }
         )
     payload = {
+        **({"observation_evidence_version": 2} if observation_evidence_version == 2 else {}),
         "schema_name": "aisimulate_fpm_repeatability_plan",
         "schema_version": 2,
         "source_plan_sha256": source_plan.sha256,
@@ -477,7 +485,8 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
         )
         if _regime(item) != _regime(original_measurement):
             raise ValueError(f"repeatability execution/seed regime changed for point {key}")
-    execution = inspect_execution_evidence(cell, root / "raw", collection, plan=plan)
+    evidence_version = selected["source_measurement"]["schema_version"]
+    execution = inspect_execution_evidence(cell, root / "raw", collection, plan=plan, evidence_version=evidence_version)
     if selected["execution"]["status"] == execution["status"] == "qualified" and _worker_identity(
         execution
     ) != _worker_identity(selected["execution"]):
@@ -489,7 +498,7 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
         "attempt_id": collection.collector_attempt_id,
         "runtime_run_id": collection.runtime_run_id,
         "runtime_grid_digest": collection.runtime_grid_digest,
-        "measurement": extract_measurement_evidence(root / "raw", collection),
+        "measurement": extract_measurement_evidence(root / "raw", collection, evidence_version=evidence_version),
         "points": {
             key: {
                 "wall_time_seconds": max(value for _, value in item.rank_wall_times),
@@ -890,6 +899,7 @@ def assess_repeatability(
         source,
         frozen_plan["source_campaign_dir"],
         frozen_plan["source_checkpoint"]["path"],
+        observation_evidence_version=frozen_plan.get("observation_evidence_version", 1),
         **frozen_plan["policy"],
     )
     if fresh != frozen_plan:
@@ -1023,6 +1033,7 @@ def run_repeatability(
     comparison_mode: str = "full_grid",
     max_attempts_per_sample: int = 2,
     source_agreement_threshold: float = 0.05,
+    observation_evidence_version: int | None = None,
 ) -> dict[str, Any]:
     """Repeat the original sweep, or collect an explicitly diagnostic bounded subset.
 
@@ -1033,6 +1044,10 @@ def run_repeatability(
         raise ValueError("repeatability retry_failed requires resume")
     if _canonical_hash(with_kv_warmup_defaults(generator_overrides)) != source_plan.generator_config_sha256:
         raise ValueError("repeatability deployment inputs differ from the original launch")
+    root = Path(output_dir).expanduser().resolve()
+    previous = json.loads((root / PLAN_FILENAME).read_text()) if resume and (root / PLAN_FILENAME).exists() else None
+    if observation_evidence_version is None:
+        observation_evidence_version = previous.get("observation_evidence_version", 1) if previous is not None else 2
     frozen = freeze_repeatability_plan(
         source_plan,
         source_campaign_dir,
@@ -1043,8 +1058,8 @@ def run_repeatability(
         comparison_mode=comparison_mode,
         max_attempts_per_sample=max_attempts_per_sample,
         source_agreement_threshold=source_agreement_threshold,
+        observation_evidence_version=observation_evidence_version,
     )
-    root = Path(output_dir).expanduser().resolve()
     source = Path(source_campaign_dir).expanduser().resolve()
     if root.is_relative_to(source) or source.is_relative_to(root):
         raise ValueError("repeatability output must be separate from the source campaign")

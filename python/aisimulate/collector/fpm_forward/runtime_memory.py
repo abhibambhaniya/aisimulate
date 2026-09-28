@@ -16,6 +16,7 @@ from typing import Any
 
 from aisimulate_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
+from .model_capability import ResolvedModelConfig
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import BackendPolicy, FPMCell, _canonical_hash
 from .runtime.fpm_memory_observer import SCHEMA_NAME, SCHEMA_VERSION, SUPPORTED_VERSION
@@ -153,6 +154,9 @@ class _SavedCapability:
     template_id: str | None
     template_version: int | None
     aic_database_version: str
+    is_moe: bool | None
+    attention_source: str | None
+    model_config: ResolvedModelConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +167,7 @@ class SavedCollectionIdentity:
     model_path: str
     system: str
     sha256: str
+    generator_config_sha256: str
     options: _SavedOptions
     capability: _SavedCapability
     cells: tuple[FPMCell, ...]
@@ -171,12 +176,19 @@ class SavedCollectionIdentity:
 def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
     validate_saved_plan(payload)
     capability = payload["capability"]
+    config = capability.get("model_config")
+    model_config = None
+    if isinstance(config, dict) and isinstance(config.get("payload"), dict) and config["payload"]:
+        model_config = ResolvedModelConfig(
+            config["payload"], source_kind=config.get("source_kind", "saved"), source_reference="saved collection plan"
+        )
     points = payload["options"].get("benchmark_points")
     return SavedCollectionIdentity(
         backend=payload["backend"],
         model_path=payload["model_path"],
         system=payload["system"],
         sha256=payload["sha256"],
+        generator_config_sha256=payload["generator_config_sha256"],
         options=_SavedOptions(
             warmup_iterations=payload["options"]["global_warmup_iterations"],
             benchmark_points_json=json.dumps(points["payload"]) if points is not None else None,
@@ -191,7 +203,10 @@ def saved_plan_identity(payload: dict[str, Any]) -> SavedCollectionIdentity:
                     "template_version",
                     "aic_database_version",
                 )
-            }
+            },
+            is_moe=capability.get("is_moe") if type(capability.get("is_moe")) is bool else None,
+            attention_source=capability.get("attention_source"),
+            model_config=model_config,
         ),
     )
 

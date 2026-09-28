@@ -4,7 +4,7 @@
 """Compare recorded benchmark conditions without using latency as evidence.
 
 The consumer contract is Dynamo's measurement_protocol/benchmark_measurement
-schema 1 (ai-dynamo/dynamo, commit 3711325087109a68296d7117fe32edd83accc094).
+schema 1 (ai-dynamo/dynamo, commit 92cf45e2e6707ac32b1fee275f949270fdd61200).
 Prompt hashes observe admission inputs, not generated tokens or cache tensors.
 Effective worker configuration is checked separately by execution validation.
 """
@@ -28,6 +28,15 @@ _UNOBSERVED = [
 ]
 _GRAPH_FIELDS = ("expected_cudagraph_mode", "expected_capture_size", "padding_tokens")
 _RUNTIME_FIELDS = ("limits", "cudagraph", "recurrent_state")
+_EXECUTION_CONTRACT = {
+    "schema_version": 1,
+    "sample_field": "benchmark_sample",
+    "warmup_field": "warmup_evidence",
+    "forward_index_scope": "rank_process",
+    "timing_clock": "process_local_monotonic",
+    "cudagraph_source": "ModelRunnerOutput.cudagraph_stats",
+    "warmup_scope": "request_completion_and_existing_shape_validation",
+}
 
 
 def _hash(value: Any) -> str:
@@ -207,7 +216,197 @@ def _read_measurement(
     return measurement, [] if recorded else [f"rank {rank}: injected prompt hashes unavailable"]
 
 
-def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -> dict[str, Any]:
+def _scheduling_observations(raw_root: Path, artifacts, collection) -> tuple[dict[str, Any], list[str]]:
+    """Read resolved scheduler/worker state, never derive it from launch defaults."""
+    observations = {str(rank): [] for rank, *_ in collection.rank_timings}
+    for path, payload in artifacts:
+        engine = payload.get("engine")
+        if not isinstance(engine, dict) or engine.get("capture_error"):
+            continue
+        scheduler = engine.get("scheduler")
+        if isinstance(scheduler, dict) and "async_scheduling" in scheduler:
+            observations[str(payload["dp"]["rank"])].append(
+                {"async_scheduling": scheduler["async_scheduling"], "source": str(path)}
+            )
+    for path in sorted(raw_root.glob("**/fpm-execution-worker-*.json")):
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict) or payload.get("status") != "observed":
+            continue
+        provenance = payload.get("collector_provenance", {})
+        rank = str(payload.get("dp_rank"))
+        if (
+            payload.get("schema_name") != "aisimulate_fpm_runtime_execution"
+            or payload.get("schema_version") != 1
+            or not isinstance(provenance, dict)
+            or provenance.get("attempt_id") != collection.collector_attempt_id
+            or payload.get("backend_version") != collection.backend_version
+            or rank not in observations
+        ):
+            raise ValueError("scheduling observation has inconsistent worker provenance")
+        config = payload.get("resolved_config")
+        scheduler = config.get("scheduler_config") if isinstance(config, dict) else None
+        if isinstance(scheduler, dict) and "async_scheduling" in scheduler:
+            observations[rank].append({"async_scheduling": scheduler["async_scheduling"], "source": str(path)})
+    result, missing = {}, []
+    for rank, items in observations.items():
+        if any(item["async_scheduling"] is not None and type(item["async_scheduling"]) is not bool for item in items):
+            raise ValueError("observed async_scheduling must be Boolean")
+        modes = {item["async_scheduling"] for item in items if item["async_scheduling"] is not None}
+        if len(modes) > 1:
+            raise ValueError(f"rank {rank}: native scheduler and workers disagree on async_scheduling")
+        result[rank] = {"async_scheduling": next(iter(modes)) if modes else None, "observations": items}
+        if not modes:
+            missing.append(f"rank {rank}: effective async_scheduling is unreported")
+    if len({item["async_scheduling"] for item in result.values()} - {None}) > 1:
+        raise ValueError("native ranks disagree on effective async_scheduling")
+    return result, missing
+
+
+def _warmup_history(payload: dict[str, Any], protocol: dict[str, Any] | None):
+    if protocol is None or "execution_evidence" not in protocol:
+        return None, []
+    if protocol["execution_evidence"] != _EXECUTION_CONTRACT:
+        raise ValueError("unsupported measurement execution_evidence contract")
+    history = payload.get("warmup_evidence")
+    if (
+        not isinstance(history, dict)
+        or history.get("status") not in {"recorded", "unavailable"}
+        or not isinstance(history.get("records"), list)
+        or (history["status"] == "unavailable" and history["records"])
+    ):
+        raise ValueError("invalid warmup_evidence status or records")
+    prefixes = [_hash([])]
+    digest = hashlib.sha256()
+    previous_completed = 0
+    previous_start = 0
+    for record in history["records"]:
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") not in {"global", "eager_shape", "real_prefix_seed", "real_prefix_shape"}
+            or record.get("status") not in {"running", "completed", "failed"}
+            or not isinstance(record.get("validation"), dict)
+            or record["validation"].get("status") not in {"not_performed", "passed", "failed"}
+            or not _integer(record.get("completed_points_before"))
+        ):
+            raise ValueError("malformed warmup_evidence record")
+        start, end = record.get("forward_index_start"), record.get("forward_index_end")
+        count = record.get("observed_forward_count")
+        if (
+            not _integer(count)
+            or any(value is not None and not _integer(value) for value in (start, end))
+            or (start is not None and end is not None and (end < start or count != end - start))
+            or (record["status"] == "running") != (end is None)
+            or (start is None and (record["kind"] != "eager_shape" or record["status"] != "failed" or count != 0))
+            or (record["validation"]["status"] == "passed" and record["status"] != "completed")
+            or (record["validation"]["status"] == "failed" and record["status"] != "failed")
+        ):
+            raise ValueError("warmup_evidence has contradictory completion or forward indices")
+        completed = record["completed_points_before"]
+        if (
+            not previous_completed <= completed <= len(payload["results"])
+            or (record["kind"] == "global" and completed != 0)
+            or (start is not None and start < previous_start)
+        ):
+            raise ValueError("warmup_evidence has impossible preparation order")
+        previous_completed = completed
+        if start is not None:
+            previous_start = start
+        digest.update(_hash(record).encode())
+        prefixes.append(digest.hexdigest())
+    return history, prefixes
+
+
+def _observed_execution(measurement, fpm, history, prefixes, previous_forward):
+    """Validate within one rank/process; absolute clocks are not compared across runs."""
+    if "benchmark_sample" in fpm:
+        raise ValueError("retained estimate cannot claim a single benchmark_sample")
+    observed, reasons = [], []
+    preceding_forward = previous_forward
+    for index, raw in enumerate(measurement["raw_fpms"]):
+        sample = raw.get("benchmark_sample")
+        if (
+            not isinstance(sample, dict)
+            or not _integer(sample.get("sample_index"))
+            or sample["sample_index"] != index
+            or not _integer(sample.get("forward_index"))
+            or sample["forward_index"] <= previous_forward
+        ):
+            raise ValueError("benchmark_sample has invalid sample or process-local forward index")
+        previous_forward = sample["forward_index"]
+        timing, graph = sample.get("timing"), sample.get("cudagraph")
+        if not isinstance(timing, dict) or timing.get("basis") not in {"schedule_to_output", "inter_output"}:
+            raise ValueError("benchmark_sample has invalid timing basis")
+        start, end = timing.get("start_monotonic"), timing.get("end_monotonic")
+        if (
+            type(end) not in {int, float}
+            or not math.isfinite(end)
+            or (
+                start is not None
+                and (
+                    type(start) not in {int, float}
+                    or not math.isfinite(start)
+                    or start > end
+                    or not math.isclose(end - start, raw["wall_time"], rel_tol=1e-9, abs_tol=1e-9)
+                )
+            )
+        ):
+            raise ValueError("benchmark_sample contradicts its local timing interval")
+        if start is None:
+            reasons.append("sample timing start is unavailable")
+        if not isinstance(graph, dict) or graph.get("status") not in {"observed", "unavailable"}:
+            raise ValueError("benchmark_sample has invalid graph observation status")
+        values = [
+            graph.get(name) for name in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
+        ]
+        if graph["status"] == "unavailable":
+            if any(value is not None for value in values):
+                raise ValueError("unavailable graph observation contains observed values")
+            reasons.append("per-sample CUDA graph dispatch is unavailable")
+        elif (
+            values[0] not in {"NONE", "PIECEWISE", "FULL"}
+            or not all(_integer(value) for value in values[1:])
+            or values[2] - values[1] != values[3]
+        ):
+            raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
+        observed.append(
+            {
+                "sample_index": index,
+                "forward_index": previous_forward,
+                "timing_basis": timing["basis"],
+                "cudagraph": graph,
+            }
+        )
+    count = measurement["preparation"].get("warmup_records_before")
+    prefix = None
+    if history["status"] == "unavailable":
+        if count is not None:
+            raise ValueError("unavailable warmup history claims an observed record count")
+        reasons.append("warmup history is unavailable")
+    elif not _integer(count) or count >= len(prefixes):
+        raise ValueError("measurement has invalid warmup_records_before")
+    else:
+        prefix = prefixes[count]
+        first_forward = observed[0]["forward_index"]
+        completed = measurement["preparation"]["completed_points_before"]
+        if count != sum(record["completed_points_before"] <= completed for record in history["records"]):
+            raise ValueError("measurement warmup_records_before contradicts preparation order")
+        for record in history["records"][:count]:
+            start, end = record["forward_index_start"], record["forward_index_end"]
+            if (start is not None and start > first_forward) or (end is not None and end > first_forward):
+                raise ValueError("recorded preparation ends after its measurement")
+            if record["completed_points_before"] == completed and any(
+                value is not None and value <= preceding_forward for value in (start, end)
+            ):
+                raise ValueError("recorded warmup preparation precedes its completed point count")
+            if record["status"] == "running":
+                prefix = None
+                reasons.append("referenced warmup preparation is still running")
+    return {"samples": observed, "warmup_prefix_sha256": prefix}, reasons, previous_forward
+
+
+def extract_measurement_evidence(
+    raw_root: Path, collection: NativeCollection, *, evidence_version: int = 2
+) -> dict[str, Any]:
     """Read schema-1 evidence for the publication-selected native samples.
 
     Call after native validation. Missing legacy evidence is explicitly
@@ -215,6 +414,8 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
     Raw adjacent steps are retained as evidence of one launch, never counted as
     independent observations. Duplicate consolidation uses publication's rule.
     """
+    if type(evidence_version) is not int or evidence_version not in {1, 2}:
+        raise ValueError("unsupported measurement evidence version")
     artifacts = _rank_artifacts(raw_root)
     if not artifacts:
         raise ValueError("measurement evidence has no native rank artifacts")
@@ -238,7 +439,7 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
         for item in selected
     }
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": evidence_version,
         "backend_version": collection.backend_version,
         "collector_attempt_id": collection.collector_attempt_id,
         "runtime_run_id": collection.runtime_run_id,
@@ -251,6 +452,22 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
         "reasons": [] if present else ["legacy artifact has no measurement protocol"],
         "unobserved": sorted(set(_UNOBSERVED + (protocol or {}).get("unobserved", []))),
     }
+    if evidence_version == 2:
+        result["scheduling"], scheduling_gaps = _scheduling_observations(raw_root, artifacts, collection)
+        result["reasons"].extend(scheduling_gaps)
+        result["warmup_evidence"] = {}
+        result["unobserved"] = sorted(
+            set(
+                result["unobserved"]
+                + [
+                    "complete_cuda_graph_descriptor",
+                    "capture_versus_replay",
+                    "gpu_execution_time",
+                    "warmup_graph_kernel_and_cache_equivalence",
+                    "decode_real_kv_chain_warmup_history",
+                ]
+            )
+        )
     seen_ranks = set()
     execution_order = None
     for path, payload in artifacts:
@@ -260,6 +477,12 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
         if not _integer(rank) or rank not in expected_ranks or rank in seen_ranks:
             raise ValueError("measurement evidence has inconsistent DP ranks")
         seen_ranks.add(rank)
+        history, prefixes = _warmup_history(payload, protocol) if evidence_version == 2 else (None, [])
+        previous_forward = -1
+        if history is not None:
+            result["warmup_evidence"][str(rank)] = history
+        elif evidence_version == 2:
+            result["reasons"].append(f"rank {rank}: per-sample execution and warmup evidence is unreported")
         if (payload.get("run_id"), payload.get("grid_digest")) != (
             collection.runtime_run_id,
             collection.runtime_grid_digest,
@@ -298,6 +521,13 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
             measurement, reasons = _read_measurement(
                 row, rank=rank, grid_digest=collection.runtime_grid_digest, position=position, protocol=protocol
             )
+            prompt_missing = bool(reasons)
+            if history is not None:
+                execution, gaps, previous_forward = _observed_execution(
+                    measurement, row["fpms"][0], history, prefixes, previous_forward
+                )
+                measurement = {**measurement, "observed_execution": execution}
+                reasons.extend(f"rank {rank}: {reason}" for reason in gaps)
             if benchmark_id in selected_ids:
                 point = points[_hash(_coordinates(row["point"]))]
                 point["ranks"][str(rank)] = (
@@ -306,13 +536,16 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
                 point["reasons"].extend(reasons)
                 if prefix_missing:
                     point["reasons"].append(f"rank {rank}: preceding prompt evidence incomplete")
-            prefix_missing |= bool(reasons)
+            prefix_missing |= prompt_missing
+            preparation = measurement["preparation"] if measurement else None
+            if evidence_version == 2 and preparation is not None:
+                preparation = {key: value for key, value in preparation.items() if key != "warmup_records_before"}
             prefix.update(
                 _hash(
                     {
                         "point": row["point"],
                         "prompts": measurement["prompts"] if measurement else None,
-                        "preparation": measurement["preparation"] if measurement else None,
+                        "preparation": preparation,
                     }
                 ).encode()
             )
@@ -321,6 +554,18 @@ def extract_measurement_evidence(raw_root: Path, collection: NativeCollection) -
         raise ValueError("measurement evidence is missing native ranks")
     for point in points.values():
         point["status"] = "unestablished" if point["reasons"] else "recorded"
+    if (
+        evidence_version == 2
+        and protocol is not None
+        and "execution_evidence" in protocol
+        and all(
+            sample["cudagraph"]["status"] == "observed"
+            for point in points.values()
+            for measurement in point["ranks"].values()
+            for sample in measurement["observed_execution"]["samples"]
+        )
+    ):
+        result["unobserved"].remove("observed_per_call_graph_dispatch")
     result["status"] = (
         "unestablished" if result["reasons"] or any(point["reasons"] for point in points.values()) else "recorded"
     )
@@ -338,15 +583,33 @@ def compare_measurements(
     """
     missing = []
     mismatches = []
+    extended = reference.get("schema_version") == 2 and candidate.get("schema_version") == 2
     for label, evidence in (("reference", reference), ("candidate", candidate)):
         missing.extend(f"{label}: {reason}" for reason in evidence.get("reasons", []))
-        if evidence.get("schema_version") != 1 or evidence.get("measurement_protocol") is None:
+        if evidence.get("schema_version") not in {1, 2} or evidence.get("measurement_protocol") is None:
             missing.append(f"{label}: missing supported measurement evidence")
         if not evidence.get("runtime_run_id"):
             missing.append(f"{label}: missing independent runtime run identity")
     for key in ("backend_version", "measurement_protocol", "runtime_identity"):
-        if reference.get(key) is not None and candidate.get(key) is not None and reference[key] != candidate[key]:
+        left_value, right_value = reference.get(key), candidate.get(key)
+        if extended and key == "measurement_protocol":
+            left_value, right_value = (
+                {name: value for name, value in item.items() if name not in {"execution_evidence", "unobserved"}}
+                if isinstance(item, dict)
+                else item
+                for item in (left_value, right_value)
+            )
+        if left_value is not None and right_value is not None and left_value != right_value:
             mismatches.append(f"{key} differs")
+    if reference.get("schema_version") == 2 or candidate.get("schema_version") == 2:
+        for rank in sorted(set(reference.get("scheduling", {})) | set(candidate.get("scheduling", {}))):
+            values = [
+                item.get("scheduling", {}).get(rank, {}).get("async_scheduling") for item in (reference, candidate)
+            ]
+            if any(type(value) is not bool for value in values):
+                missing.append(f"rank {rank}: effective async_scheduling comparison is unestablished")
+            elif values[0] != values[1]:
+                mismatches.append(f"rank {rank}: effective async_scheduling differs")
     if reference.get("runtime_run_id") and reference.get("runtime_run_id") == candidate.get("runtime_run_id"):
         mismatches.append("runtime_run_id is not an independent launch")
     left = reference.get("points", {}).get(point_key)
@@ -371,9 +634,42 @@ def compare_measurements(
             for key in ("point_key", "prompts", "expected_internal_samples", "estimate"):
                 if lhs[key] != rhs[key]:
                     mismatches.append(f"rank {rank}: {key} differs")
+            observed_left, observed_right = lhs.get("observed_execution"), rhs.get("observed_execution")
+            if observed_left is not None and observed_right is not None:
+                # Relative forward order belongs to matched-sweep preparation;
+                # absolute process-local timestamps never establish equality.
+                fields = (
+                    ("sample_index", "timing_basis", "forward_index")
+                    if same_context
+                    else ("sample_index", "timing_basis")
+                )
+                left_samples, right_samples = observed_left["samples"], observed_right["samples"]
+                if len(left_samples) != len(right_samples):
+                    mismatches.append(f"rank {rank}: observed sample count differs")
+                for a, b in zip(left_samples, right_samples, strict=False):
+                    if any(a[name] != b[name] for name in fields):
+                        mismatches.append(f"rank {rank}: observed sample order or timing basis differs")
+                    if a["cudagraph"]["status"] == b["cudagraph"]["status"] == "observed":
+                        if a["cudagraph"] != b["cudagraph"]:
+                            mismatches.append(f"rank {rank}: observed graph dispatch differs")
+                    else:
+                        missing.append(f"rank {rank}: observed graph dispatch comparison is unestablished")
+                if same_context:
+                    if observed_left["warmup_prefix_sha256"] is None or observed_right["warmup_prefix_sha256"] is None:
+                        missing.append(f"rank {rank}: observed warmup comparison is unestablished")
+                    elif observed_left["warmup_prefix_sha256"] != observed_right["warmup_prefix_sha256"]:
+                        mismatches.append(f"rank {rank}: observed warmup preparation differs")
+            elif extended or (observed_left is None) != (observed_right is None):
+                missing.append(f"rank {rank}: per-sample execution comparison is unestablished")
             if same_context:
                 for key in ("preparation", "execution_prefix_sha256"):
-                    if lhs[key] != rhs[key]:
+                    left_value, right_value = lhs[key], rhs[key]
+                    if extended and key == "preparation":
+                        left_value, right_value = (
+                            {name: value for name, value in item.items() if name != "warmup_records_before"}
+                            for item in (left_value, right_value)
+                        )
+                    if left_value != right_value:
                         mismatches.append(f"rank {rank}: {key} differs")
     if same_context:
         for key in ("runtime_grid_digest", "benchmark_config"):
@@ -387,7 +683,17 @@ def compare_measurements(
         "status": "unestablished" if not same_context and identity_status == "comparable" else identity_status,
         "identity_status": identity_status,
         "reasons": reasons,
-        "unobserved": sorted(set(_UNOBSERVED + reference.get("unobserved", []) + candidate.get("unobserved", []))),
+        "unobserved": sorted(
+            set(
+                (
+                    _UNOBSERVED
+                    if reference.get("schema_version") != 2 or candidate.get("schema_version") != 2
+                    else _UNOBSERVED[:-1]
+                )
+                + reference.get("unobserved", [])
+                + candidate.get("unobserved", [])
+            )
+        ),
         "scope": "recorded measurement protocol and injected prompts; worker runtime validation remains required",
         "context": "matched_native_sweep" if same_context else "cross_context_unproven",
     }

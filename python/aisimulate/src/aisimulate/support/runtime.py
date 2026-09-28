@@ -355,10 +355,16 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     """Revalidate source files and the exact runtime binding of an imported draft."""
     manifest = runtime_probe_manifest(request)
     if manifest is None:
-        from .finalization import _merge_resources, _verify_collection, finalization_manifest
+        from .finalization import (
+            _merge_resources,
+            _verify_collection,
+            finalization_manifest,
+            verify_finalized_quality,
+        )
         from .plan import request_id
 
         finalized = finalization_manifest(request)
+        quality = verify_finalized_quality(finalized) if finalized is not None else None
         if finalized is not None and "runtime_probe" in finalized:
             root = Path(finalized["source_directory"])
             original = SupportRequest.from_yaml(root / "request.yaml")
@@ -370,6 +376,8 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
             observations, evidence, _, _ = _verify_collection(
                 original, root, memory_revision=finalized.get("memory_revision")
             )
+            if quality is not None:
+                evidence["collection_quality"] = quality
             expected = _merge_resources(
                 observations,
                 evidence,

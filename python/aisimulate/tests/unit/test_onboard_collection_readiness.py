@@ -18,6 +18,7 @@ from aisimulate import main as cli
 from aisimulate.support import fpm
 from aisimulate.support.collection_readiness import assess_readiness, resume_without_workers
 
+from .collector.test_fpm_measurement_evidence import _add_measurement_protocol
 from .test_support_serving_validation import materialized_workload  # noqa: F401
 from .test_support_validation import validation_case  # noqa: F401
 from .test_support_validation_workflow import quality_case  # noqa: F401
@@ -49,6 +50,7 @@ def _change_decode(case, *, fake=None, kvwarm="unchanged"):
                         row["kv_seed_regime"] = "fake_fallback"
                         row["point"]["sample_reasons"] = ["kvwarm_fake_fallback"]
                         payload["iteration_groups"][index]["point"]["sample_reasons"] = ["kvwarm_fake_fallback"]
+            _add_measurement_protocol(payload)
             path.write_text(json.dumps(payload))
 
 

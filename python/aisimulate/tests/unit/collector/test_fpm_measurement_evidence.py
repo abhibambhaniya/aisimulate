@@ -19,7 +19,79 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _add_measurement_protocol(payload, *, seed="0"):
+def _add_execution_protocol(payload, *, clock_offset=0.0):
+    # Synthetic observations of the documented Dynamo #15110 contract, not
+    # expectations reconstructed from an engine configuration.
+    payload["measurement_protocol"]["execution_evidence"] = {
+        "schema_version": 1,
+        "sample_field": "benchmark_sample",
+        "warmup_field": "warmup_evidence",
+        "forward_index_scope": "rank_process",
+        "timing_clock": "process_local_monotonic",
+        "cudagraph_source": "ModelRunnerOutput.cudagraph_stats",
+        "warmup_scope": "request_completion_and_existing_shape_validation",
+    }
+    payload["warmup_evidence"] = {
+        "status": "recorded",
+        "records": [
+            {
+                "kind": "global",
+                "requested_shape": {"prompt_lengths": [8]},
+                "status": "completed",
+                "forward_index_start": 0,
+                "forward_index_end": 3,
+                "completed_points_before": 0,
+                "observed_forward_count": 3,
+                "first_scheduled_requests": {"num_requests": 1},
+                "last_scheduled_requests": {"num_requests": 1},
+                "validation": {"status": "not_performed"},
+            }
+        ],
+    }
+    forward_index = 3
+    for index, row in enumerate(payload["results"]):
+        point = row["point"]
+        group = next(item for item in payload["iteration_groups"] if item["point"] == point)
+        fpms = [*row["fpms"], *(fpm for rank in group["rank_results"] for fpm in rank["fpms"])]
+        for fpm in fpms:
+            measurement = fpm["benchmark_measurement"]
+            measurement["preparation"]["warmup_records_before"] = 1
+            for sample_index, raw in enumerate(measurement["raw_fpms"]):
+                start = clock_offset + measurement["dp_rank"] * 1000 + index + sample_index
+                tokens = point["total_prefill_tokens"] or point["batch_size"]
+                padded = point["expected_capture_size"] or tokens
+                raw["benchmark_sample"] = {
+                    "sample_index": sample_index,
+                    "forward_index": forward_index + sample_index,
+                    "timing": {
+                        "basis": "schedule_to_output" if sample_index == 0 else "inter_output",
+                        "start_monotonic": start,
+                        "end_monotonic": start + raw["wall_time"],
+                    },
+                    "cudagraph": {
+                        "status": "observed",
+                        "runtime_mode": point["expected_cudagraph_mode"],
+                        "num_unpadded_tokens": tokens,
+                        "num_padded_tokens": padded,
+                        "num_paddings": padded - tokens,
+                    },
+                }
+        forward_index += len(row["fpms"][0]["benchmark_measurement"]["raw_fpms"])
+
+
+def _remove_execution_protocol(payload):
+    payload["measurement_protocol"].pop("execution_evidence", None)
+    payload.pop("warmup_evidence", None)
+    fpms = [fpm for row in payload["results"] for fpm in row["fpms"]]
+    fpms.extend(fpm for group in payload["iteration_groups"] for rank in group["rank_results"] for fpm in rank["fpms"])
+    for fpm in fpms:
+        measurement = fpm["benchmark_measurement"]
+        measurement["preparation"].pop("warmup_records_before", None)
+        for raw in measurement["raw_fpms"]:
+            raw.pop("benchmark_sample", None)
+
+
+def _add_measurement_protocol(payload, *, seed="0", execution=True):
     """Add the producer's observed metadata to a synthetic native rank artifact."""
     payload["measurement_protocol"] = {
         "schema_version": 1,
@@ -78,6 +150,11 @@ def _add_measurement_protocol(payload, *, seed="0"):
             if rank == payload["dp"]["rank"]:
                 row["fpms"] = [copy.deepcopy(fpm)]
 
+    if execution:
+        _add_execution_protocol(payload)
+    else:
+        _remove_execution_protocol(payload)
+
 
 def _artifacts(tmp_path, *, run="run-a", seed="0", duplicate=False, order=(1, 2), factor=1.0):
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -135,6 +212,7 @@ def _artifacts(tmp_path, *, run="run-a", seed="0", duplicate=False, order=(1, 2)
             "limits": {"block_size": 16, "max_model_len": 256000},
             "cudagraph": {"mode": "FULL_AND_PIECEWISE", "capture_sizes": [4, 8]},
             "recurrent_state": {"initialization": "unchanged", "policy": None, "uniform_bound": None},
+            "engine": {"scheduler": {"async_scheduling": False}},
             "results": results,
             "iteration_groups": groups,
         }
@@ -165,7 +243,7 @@ def test_matching_conditions_remain_comparable_despite_slow_samples(tmp_path):
     assert comparison["status"] == "comparable"
     assert left["points"][key]["wall_time_seconds"] * 6 == right["points"][key]["wall_time_seconds"]
     assert "kv_cache_tensors" in comparison["unobserved"]
-    assert "observed_per_call_graph_dispatch" in comparison["unobserved"]
+    assert "observed_per_call_graph_dispatch" not in comparison["unobserved"]
     assert left["points"][key]["ranks"]["0"]["prompts"] != left["points"][key]["ranks"]["1"]["prompts"]
 
 
@@ -370,6 +448,7 @@ def test_internal_decode_samples_remain_one_launch_estimate(tmp_path):
         )
 
     _edit(tmp_path, adjacent)
+    _edit(tmp_path, _add_execution_protocol)
     evidence = extract_measurement_evidence(tmp_path, collection)
     point = next(iter(evidence["points"].values()))
     assert evidence["measurement_protocol"]["independent_repetitions"] == 1

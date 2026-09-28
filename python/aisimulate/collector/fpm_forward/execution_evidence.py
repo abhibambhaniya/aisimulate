@@ -60,6 +60,18 @@ class _MissingExecutionEvidence(ValueError):
     pass
 
 
+def _requested_scheduling(flags: dict[str, Any] | None) -> dict[str, Any]:
+    if flags is None:
+        return {"source": "unreported", "async_scheduling": None}
+    choices = [
+        name == "--async-scheduling" for name in flags if name in {"--async-scheduling", "--no-async-scheduling"}
+    ]
+    return {
+        "source": "generated_flag" if choices else "runtime_default",
+        "async_scheduling": choices[-1] if choices else None,
+    }
+
+
 def _effective_launch(plan: FPMCollectionPlan, cell_dir: Path) -> dict[str, Any]:
     """Read the generator's literal argv array; never evaluate archived shell."""
     try:
@@ -327,7 +339,7 @@ def file_evidence(path: Path) -> dict[str, Any]:
 
 
 def inspect_execution_evidence(
-    cell: FPMCell, raw_root: Path, collection: NativeCollection, *, plan: FPMCollectionPlan
+    cell: FPMCell, raw_root: Path, collection: NativeCollection, *, plan: FPMCollectionPlan, evidence_version: int = 2
 ) -> dict[str, Any]:
     """Require actual worker observations; native point expectations stay labelled.
 
@@ -335,6 +347,8 @@ def inspect_execution_evidence(
     execution observations leave qualification incomplete without invalidating
     historical timing artifacts or manufacturing a requested backend identity.
     """
+    if type(evidence_version) is not int or evidence_version not in {1, 2}:
+        raise ValueError("unsupported execution evidence version")
     missing = []
     failures = []
     flags = None
@@ -350,6 +364,7 @@ def inspect_execution_evidence(
         missing.append(f"execution configuration inspection is unaudited for {collection.backend_version}")
     workers = []
     ranks = set()
+    scheduling = {"requested": _requested_scheduling(flags), "observed_workers": []}
     for path in sorted(raw_root.glob("**/fpm-execution-worker-*.json")):
         payload = json.loads(path.read_text())
         if not isinstance(payload, dict):
@@ -391,6 +406,15 @@ def inspect_execution_evidence(
         ):
             failures.append(f"runtime attention group observation is malformed: {path}")
         _inspect_config(payload, cell, plan, flags, missing, failures)
+        config = payload.get("resolved_config")
+        scheduler = config.get("scheduler_config") if isinstance(config, dict) else None
+        scheduling["observed_workers"].append(
+            {
+                "rank": list(rank),
+                "async_scheduling": scheduler.get("async_scheduling") if isinstance(scheduler, dict) else None,
+                "source": item["source"],
+            }
+        )
     expected = {
         (dp, tp, pp)
         for dp in range(cell.topology.dp)
@@ -401,6 +425,20 @@ def inspect_execution_evidence(
         raise ValueError("runtime execution observations contain unexpected worker ranks")
     if ranks != expected:
         missing.append(f"worker execution observations missing for ranks {sorted(expected - ranks)}")
+    modes = {
+        item["async_scheduling"] for item in scheduling["observed_workers"] if type(item["async_scheduling"]) is bool
+    }
+    if evidence_version == 2 and len(modes) > 1:
+        failures.append("workers disagree on effective async_scheduling")
+    scheduling["effective_async_scheduling"] = next(iter(modes)) if len(modes) == 1 else None
+    scheduling["status"] = (
+        "mismatch"
+        if len(modes) > 1
+        else "observed"
+        if len(scheduling["observed_workers"]) == len(expected)
+        and all(type(item["async_scheduling"]) is bool for item in scheduling["observed_workers"])
+        else "unestablished"
+    )
     native_graphs = []
     for path, payload in _rank_artifacts(raw_root):
         native_graphs.append(
@@ -433,6 +471,18 @@ def inspect_execution_evidence(
     if cpu["policy_required"]:
         missing.extend(f"CPU affinity: {message}" for message in cpu["missing_evidence"])
         failures.extend(f"CPU affinity: {message}" for message in cpu["failures"])
+    dispatch = "unreported"
+    if evidence_version == 2:
+        from .measurement_evidence import extract_measurement_evidence
+
+        measurements = extract_measurement_evidence(raw_root, collection)
+        missing.extend(f"measurement evidence: {reason}" for reason in measurements["reasons"])
+        for point in measurements["points"].values():
+            missing.extend(f"measurement evidence: {reason}" for reason in point["reasons"])
+        if measurements["warmup_evidence"]:
+            dispatch = (
+                "observed" if "observed_per_call_graph_dispatch" not in measurements["unobserved"] else "incomplete"
+            )
     return {
         "status": "failed" if failures else "incomplete" if missing else "qualified",
         "missing_evidence": sorted(set(missing)),
@@ -441,6 +491,14 @@ def inspect_execution_evidence(
         "native_graph_config": native_graphs,
         "kv_seed_regime_counts": dict(regimes),
         "cpu_affinity": cpu,
-        "per_point_dispatch": "unreported",
-        "scope": "initialized attention backends and resolved graph configuration; no per-point dispatch trace",
+        **({"scheduling": scheduling} if evidence_version == 2 else {}),
+        "per_point_dispatch": dispatch,
+        "scope": "initialized attention backends and resolved graph configuration; "
+        + (
+            "per-sample native dispatch observations"
+            if dispatch == "observed"
+            else "no complete per-point dispatch trace"
+            if evidence_version == 2
+            else "no per-point dispatch trace"
+        ),
     }

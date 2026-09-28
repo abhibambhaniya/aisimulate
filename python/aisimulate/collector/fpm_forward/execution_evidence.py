@@ -118,6 +118,40 @@ def _effective_launch(plan: FPMCollectionPlan, cell_dir: Path) -> dict[str, Any]
     return flags
 
 
+def _matches_pinned_hub_snapshot(expected: str, model: dict[str, Any], revisions: set[Any]) -> bool:
+    """Recognize a resolved Hub cache identity, not an arbitrary local alias.
+
+    Offline vLLM can replace the Hub ID with its cached snapshot directory.
+    Require its full repository identity and immutable commit to agree with
+    both the source pins and the loaded config; this is not a weight hash.
+    """
+    if (
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*/[A-Za-z0-9_][A-Za-z0-9._-]*", expected) is None
+        or "--" in expected
+        or ".." in expected
+        or any(part.endswith((".", "-", ".git")) for part in expected.split("/"))
+    ):
+        return False
+    observed = model["model"]
+    path = PurePosixPath(observed)
+    if path.anchor != "/" or str(path) != observed or ".." in path.parts or "\\" in observed or "\x00" in observed:
+        return False
+    if len(path.parts) < 4 or path.parts[-3:-1] != (f"models--{expected.replace('/', '--')}", "snapshots"):
+        return False
+    commit = path.name
+    if re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None or not revisions:
+        return False
+    if any(
+        not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+        or revision.lower() != commit.lower()
+        for revision in revisions
+    ):
+        return False
+    loaded = model.get("loaded_config_commit_hash")
+    return isinstance(loaded, str) and loaded.lower() == commit.lower()
+
+
 def _inspect_config(payload, cell, plan, flags, missing, failures):
     config = payload.get("resolved_config")
     if not isinstance(config, dict):
@@ -165,6 +199,8 @@ def _inspect_config(payload, cell, plan, flags, missing, failures):
         for name, value in fields.items():
             if name in valid.get(section, {}) and valid[section][name] != value:
                 failures.append(f"runtime {section}.{name} differs from the frozen plan")
+    expected_revision = plan.fpm_profile.model_revision if plan.fpm_profile is not None else None
+    revisions = {value for value in (expected_revision, (flags or {}).get("--revision")) if value is not None}
     launch_fields = {
         "--model": ("model_config", "model", str),
         "--max-model-len": ("model_config", "max_model_len", int),
@@ -199,6 +235,8 @@ def _inspect_config(payload, cell, plan, flags, missing, failures):
             if (flag == "--max-model-len" and value == -1) or (flag == "--moe-backend" and value == "auto"):
                 continue
             if valid[section][name] != value:
+                if flag == "--model" and _matches_pinned_hub_snapshot(value, config["model_config"], revisions):
+                    continue
                 failures.append(f"runtime {section}.{name} differs from generated {flag}")
         for flag, section, name in (
             ("async-scheduling", "scheduler_config", "async_scheduling"),
@@ -213,8 +251,6 @@ def _inspect_config(payload, cell, plan, flags, missing, failures):
                 failures.append(f"runtime precision differs from generated {flag}")
         if "--quantization" in flags and "quantization" in model and model["quantization"] != flags["--quantization"]:
             failures.append("runtime quantization differs from generated --quantization")
-    expected_revision = plan.fpm_profile.model_revision if plan.fpm_profile is not None else None
-    revisions = {value for value in (expected_revision, (flags or {}).get("--revision")) if value is not None}
     if not revisions:
         missing.append("source has no pinned model revision")
     raw_model = config.get("model_config")

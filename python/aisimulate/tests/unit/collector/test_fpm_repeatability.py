@@ -11,11 +11,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from collector.fpm_forward import cli, repeatability, runner
+from collector.fpm_forward import cli, execution_evidence, repeatability, runner
 from collector.fpm_forward.config import with_kv_warmup_defaults
 from collector.fpm_forward.database import aggregate_cell
 from collector.fpm_forward.native_artifact import (
     _expected_scheduled,
+    validate_native_collection,
 )
 from collector.fpm_forward.runtime import fpm_memory_observer as observer
 from collector.fpm_forward.runtime_memory import validate_saved_plan
@@ -622,6 +623,153 @@ def test_explicit_local_checkpoint_uses_loaded_revision_evidence(campaign, tmp_p
     assert result["status"] == {"correct": "passed", "missing": "incomplete", "wrong": "failed"}[evidence]
     if evidence == "wrong":
         assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("observed", "qualified"),
+    [
+        ("/root/.cache/huggingface/hub/{repo}/snapshots/{revision}", True),
+        ("/custom/cache/{repo}/snapshots/{revision}", True),
+        ("/custom/cache/{repo}/snapshots/{revision}/config.json", False),
+        ("/custom/cache/models--other--GLM-5.2-NVFP4/snapshots/{revision}", False),
+        ("/custom/cache/models--nvidia--other/snapshots/{revision}", False),
+        ("/custom/cache/models--nvidia--GLM-5.2-NVFP4-extra/snapshots/{revision}", False),
+        ("/custom/cache/datasets--nvidia--GLM-5.2-NVFP4/snapshots/{revision}", False),
+        ("/custom/cache/{repo}/snapshot/{revision}", False),
+        ("/custom/cache/{repo}/refs/{revision}", False),
+        ("/custom/cache/{repo}/snapshots/main", False),
+        ("/custom/cache/{repo}/snapshots/{other_revision}", False),
+        ("/arbitrary/local-checkpoint/{revision}", False),
+        ("/arbitrary/local-checkpoint", False),
+        ("custom/cache/{repo}/snapshots/{revision}", False),
+        ("//custom/cache/{repo}/snapshots/{revision}", False),
+        ("/custom//cache/{repo}/snapshots/{revision}", False),
+        ("/custom/./cache/{repo}/snapshots/{revision}", False),
+        ("/custom/../cache/{repo}/snapshots/{revision}", False),
+        ("/custom/cache/{repo}/snapshots/{revision}/", False),
+        ("/custom/cache/{repo}/snapshots/{revision}/..", False),
+        ("/custom\\cache/{repo}/snapshots/{revision}", False),
+        ("/custom\x00cache/{repo}/snapshots/{revision}", False),
+    ],
+)
+def test_pinned_hub_model_accepts_only_its_canonical_snapshot_identity(campaign, observed, qualified):
+    plan, source, checkpoint = campaign
+    revision = "a" * 40
+    profile = json.loads(plan._fpm_profile_json)
+    profile["model_revision"] = revision
+    plan = replace(plan, _fpm_profile_json=json.dumps(profile))
+    _write_campaign(source, checkpoint, plan)
+    snapshot = observed.format(
+        repo=f"models--{plan.model_path.replace('/', '--')}", revision=revision, other_revision="b" * 40
+    )
+
+    def alter(payload):
+        payload["resolved_config"]["model_config"].update(model=snapshot, loaded_config_commit_hash=revision)
+
+    _mutate_workers(source, alter)
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if qualified else "failed"), result["failures"]
+    if not qualified:
+        assert "runtime model_config.model differs from generated --model" in result["failures"]
+
+
+@pytest.mark.parametrize(
+    ("pin", "observed_revision", "loaded", "qualified"),
+    [
+        ("a" * 40, "a" * 40, "a" * 40, True),
+        ("A" * 40, "A" * 40, "A" * 40, True),
+        ("a" * 40, None, "a" * 40, True),
+        ("a" * 40, "a" * 40, None, False),
+        ("a" * 40, None, None, False),
+        ("a" * 40, "a" * 40, "b" * 40, False),
+        ("a" * 40, "b" * 40, "a" * 40, False),
+        ("a" * 40, "a" * 40, "a" * 39, False),
+        ("a" * 40, "a" * 40, 123, False),
+        ("release-tag", "release-tag", "a" * 40, False),
+        ("a" * 39, "a" * 39, "a" * 40, False),
+    ],
+)
+def test_resolved_hub_snapshot_requires_pinned_loaded_revision(campaign, pin, observed_revision, loaded, qualified):
+    plan, source, checkpoint = campaign
+    profile = json.loads(plan._fpm_profile_json)
+    profile["model_revision"] = pin
+    plan = replace(plan, _fpm_profile_json=json.dumps(profile))
+    _write_campaign(source, checkpoint, plan)
+    snapshot = f"/cache/models--{plan.model_path.replace('/', '--')}/snapshots/{'a' * 40}"
+
+    def alter(payload):
+        model = payload["resolved_config"]["model_config"]
+        model.update(model=snapshot, revision=observed_revision)
+        if loaded is not None:
+            model["loaded_config_commit_hash"] = loaded
+
+    _mutate_workers(source, alter)
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if qualified else "failed"), result["failures"]
+
+
+@pytest.mark.parametrize("launch_revision", ["a" * 40, "b" * 40, "release-tag", ""])
+def test_resolved_hub_snapshot_does_not_override_generated_revision(campaign, launch_revision):
+    plan, source, checkpoint = campaign
+    revision = "a" * 40
+    profile = json.loads(plan._fpm_profile_json)
+    profile["model_revision"] = revision
+    plan = replace(plan, _fpm_profile_json=json.dumps(profile))
+    _write_campaign(source, checkpoint, plan)
+    _mutate_workers(
+        source,
+        lambda payload: payload["resolved_config"]["model_config"].update(
+            model=f"/cache/models--{plan.model_path.replace('/', '--')}/snapshots/{revision}",
+            loaded_config_commit_hash=revision,
+        ),
+    )
+    cell = plan.cells[0]
+    directory = source / "cells" / cell.cell_id
+    script = directory / "run.sh"
+    command = script.read_text()
+    prefix = "engine_command=(python3 -m dynamo.vllm "
+    assert command.count(prefix) == 1
+    script.write_text(command.replace(prefix, f"{prefix}--revision {launch_revision} "))
+    collection = validate_native_collection(
+        cell, directory / "raw", expected_plan_sha256=plan.sha256, expected_attempt_id="source"
+    )
+    result = execution_evidence.inspect_execution_evidence(cell, directory / "raw", collection, plan=plan)
+    assert result["status"] == ("qualified" if launch_revision == revision else "failed")
+    if launch_revision != revision:
+        assert "runtime model_config.model differs from generated --model" in result["failures"]
+
+
+def test_explicit_checkpoint_mount_does_not_accept_a_hub_snapshot_alias(campaign):
+    plan, source, checkpoint = campaign
+    revision = "a" * 40
+    profile = json.loads(plan._fpm_profile_json)
+    profile["model_revision"] = revision
+    deployment = {"K8sConfig": {"k8s_pvc_mount_path": "/models", "k8s_model_path_in_pvc": "checkpoint"}}
+    plan = replace(
+        plan,
+        _fpm_profile_json=json.dumps(profile),
+        generator_config_sha256=repeatability._canonical_hash(with_kv_warmup_defaults(deployment)),
+    )
+    _write_campaign(source, checkpoint, plan, generator_overrides=deployment)
+    _mutate_workers(
+        source,
+        lambda payload: payload["resolved_config"]["model_config"].update(
+            model=f"/cache/models--{plan.model_path.replace('/', '--')}/snapshots/{revision}",
+            loaded_config_commit_hash=revision,
+        ),
+    )
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed"
+    assert "runtime model_config.model differs from generated --model" in result["failures"]
 
 
 @pytest.mark.parametrize("observed", [128, 256])

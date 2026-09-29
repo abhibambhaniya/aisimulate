@@ -1671,6 +1671,8 @@ class BaseBackend:
         """Run the agg (continuous-batching) inference for a single (b, ctx_tokens) point."""
         text_isl = runtime_config.isl
         osl = runtime_config.osl
+        # Same normalization as run_mixed so None and 0 share one cache entry
+        # and the echoed result_dict["prefix"] is always an int.
         prefix = int(runtime_config.prefix or 0)
         b = runtime_config.batch_size
         img_ctx_tokens = self._visual_context_tokens(model, runtime_config)
@@ -1685,8 +1687,9 @@ class BaseBackend:
         # what SGLang --chunked-prefill-size, vLLM max_num_batched_tokens and
         # the TRT-LLM scheduler's max_num_tokens actually cap — so the schedule
         # below packs requests by ``isl_new``. The cached prefix still reaches
-        # the per-step cost (run_mixed, as KV context) and the KV footprint
-        # (_get_memory_usage); both receive the full ``isl`` and ``prefix``.
+        # the per-step cost (run_mixed, as KV context), which receives the
+        # full ``isl`` and ``prefix``; the KV footprint is sized from the full
+        # ``isl`` and does not depend on the prefix.
         isl_new = max(isl - prefix, 1)
         # A mixed step cannot hold more uncached tokens than the batch owns, so
         # the schedule runs on the budget capped at b * isl_new: the packed
@@ -1731,9 +1734,30 @@ class BaseBackend:
             runtime_config.num_videos_per_request,
             runtime_config.num_video_tokens,
         )
+        # Cache identity: every RuntimeConfig field run_agg (or run_mixed /
+        # _get_genonly_step_estimate, which it delegates to) reads must appear
+        # in exactly one of the key parts below, or a reused backend serves
+        # another request's summary. Current inventory:
+        #   _make_agg_cache_key : isl, osl, batch_size (+ ctx_tokens / agg kwargs)
+        #   visual_cache_key    : image_height, image_width, num_images_per_request,
+        #                         num_image_tokens, video_height, video_width,
+        #                         video_frames, num_videos_per_request, num_video_tokens
+        #   runtime_cache_key   : prefix (mixed-step schedule and attention cost,
+        #                         activation footprint via ctx_budget /
+        #                         num_gen_requests, echoed result_dict),
+        #                         seq_imbalance_correction_scale,
+        #                         gen_seq_imbalance_correction_scale (step latencies)
+        # engine_step_backend is validated live below and intentionally excluded.
+        # A new RuntimeConfig field that run_agg reads goes into runtime_cache_key.
+        runtime_cache_key = (
+            prefix,
+            runtime_config.seq_imbalance_correction_scale,
+            runtime_config.gen_seq_imbalance_correction_scale,
+        )
         cache_key = (
             self._make_agg_cache_key(isl, osl, b, ctx_tokens, agg_extra),
             visual_cache_key,
+            runtime_cache_key,
             # Explicit progress and an omitted kwarg schedule identically at
             # 1.0 but record different scheduling metadata, so they must not
             # share a cache entry.

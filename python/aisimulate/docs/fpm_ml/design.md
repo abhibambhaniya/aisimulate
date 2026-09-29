@@ -781,6 +781,18 @@ cross-workload cells are within 2–3 pp except prefill LongBench → ShareGPT, 
 atomic features give 72 % against 36 % for the 18 (§8.8 b): when the training traffic
 differs from the simulated traffic, use the 18 for prefill.
 
+What "smaller" means for the trees (scikit-learn HGB grows leaf-count-limited, depth-unlimited
+trees, so the leaf count is the knob; the measured depths are from the trained vLLM artifacts):
+
+| model | trees | leaves per tree | nodes per tree | nodes total | depth: mean walked / deepest leaf |
+| --- | --- | --- | --- | --- | --- |
+| default | 400 | 31 | 61 | 24,400 | 3.1–5.8 / 17 (decode), 19 (prefill) |
+| decode, recommended | 100 | 7 | 13 | 1,300 | ≤ 6 |
+| prefill, recommended | 100 | 15 | 29 | 2,900 | ≤ 14 |
+
+Cost per estimate is trees × depth walked, so both cuts are needed for the 4–5×; the learning
+rate is raised from 0.05 to 0.2 so that 100 trees fit to the same residual as 400.
+
 Four findings support this:
 
 1. **Time per estimate depends on trees × leaves, not on the feature count.** 100 × 7 is

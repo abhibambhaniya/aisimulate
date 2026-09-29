@@ -69,7 +69,7 @@ The same requirement holds for the SGLang simulator's own collection hook.
 ### Per-request fields
 
 Stock Dynamo FPM v1 (both backends) carries aggregates only. The per-request
-presets (`sglang18`, `hisim`) need two additive, aligned lists in
+presets (`atomic5`, `atomic10`, `sglang18`, `hisim`) need two additive, aligned lists in
 `scheduled_requests`, one entry per scheduled request in any order (the
 consumer sorts; only the alignment of the two lists matters):
 
@@ -176,22 +176,25 @@ python -m aisimulate_core.sdk.fpm_learned train \
     `is_decode`/`is_prefill`; preset `sglang18`);
   - 32 HiSim-style request slots sorted by past KV descending, each
     `(present, past, extend)` (preset `hisim`);
-  Reduced sets are trained by passing the names to `--features`. `design.md` §3.1
-  works out which of the 18 are needed: on decode five carry everything
-  (`req_batch_size,req_sum_past,req_max_past,req_min_past,req_sum_past_squared`,
-  identical accuracy to the 18 on every train/test pair measured; not valid with
-  speculative decoding), on prefill every reduced set loses accuracy across
-  workloads, so prefill keeps the 18. Fewer features do not make inference faster;
-  the 400-tree walk dominates.
+  `design.md` §3.1 derives the atomic sets, the smallest subsets from which all 18
+  can be computed back: decode 5 (`atomic5`), prefill 10 (`atomic10`). They are
+  the trainer defaults. Decode 5 matches the 18 on every train/test pair
+  measured (not valid with speculative decoding); prefill 10 matches the 18
+  in-distribution and trails it only when extrapolating across workloads.
+  Fewer features do not make inference faster; the tree walk dominates.
   The per-request groups need the `extend_lengths` / `past_kv_lengths`
   producer fields described above. Lists must be aligned and cover every
   scheduled request; the Rust validator rejects partial vectors, and an
   artifact that uses `req_*` / `slot*` features **refuses** (error, not a
   constant prediction) iterations that carry no consistent lists, because
   the trees never saw those features missing during training.
-  `--features` takes a preset name or a comma-separated list; the default is
-  `sglang18` (the 18 per-request features). Aggregate-only streams must opt in
-  with `--features v1`.
+  `--features` takes a preset name or a comma-separated list. Defaults are the
+  atomic sets: `atomic5` for `--worker-type decode` (n, Σ past, max/min past,
+  Σ past²) and `atomic10` for prefill / aggregated (those plus Σ/max/min extend,
+  Σ extend·past, Σ extend²). `sglang18` is the full 18-feature set they were
+  derived from; use it for a prefill model that must extrapolate to traffic
+  unlike its training data. Aggregate-only streams must opt in with
+  `--features v1`.
 - The model is a scikit-learn `HistGradientBoostingRegressor` on
   `log(wall_ms)` per store, exported to plain JSON
   (`schema = aic_fpm_learned_forward_perf`, version 1). No pickle is involved
@@ -418,12 +421,12 @@ The Rust cost is a 400-tree walk of about 3.3 µs plus one pass over the per-req
 Smaller models are 4–5× faster at the same accuracy (`design.md` §8.7–8.8, measured on the
 GB300 SGLang and vLLM captures): time per estimate scales with trees × leaves, and the
 same-workload accuracy is flat down to 50 trees of 7 leaves. Trained with the existing
-options, no code change:
+options:
 
 | role | features | `--max-iter` | `--learning-rate` | `--max-leaf-nodes` | Rust µs (was) | test MAPE (was) |
 | --- | --- | --- | --- | --- | --- | --- |
-| decode | `req_batch_size,req_sum_past,req_max_past,req_min_past,req_sum_past_squared` | 100 | 0.2 | 7 | 0.8–1.6 (3.4–5.5) | 3.3 % (4.0 %) |
-| prefill | `req_batch_size,req_sum_extend,req_max_extend,req_min_extend,req_sum_past,req_max_past,req_min_past,req_sum_extend_x_past,req_sum_extend_squared,req_sum_past_squared` | 100 | 0.2 | 15 | 0.8–1.1 (4.5–6.3) | 5.0 % (5.1 %) |
+| decode | `atomic5` (default) | 100 | 0.2 | 7 | 0.8–1.6 (3.4–5.5) | 3.3 % (4.0 %) |
+| prefill | `atomic10` (default) | 100 | 0.2 | 15 | 0.8–1.1 (4.5–6.3) | 5.0 % (5.1 %) |
 
 The five decode features are the ones with information on a decode step (every request
 extends by one token); not for speculative decoding. The ten prefill features are the

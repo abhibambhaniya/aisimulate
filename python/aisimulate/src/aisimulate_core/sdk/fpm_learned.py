@@ -112,21 +112,57 @@ SLOT_FEATURE_NAMES: tuple[str, ...] = tuple(
 )
 FEATURE_NAMES: tuple[str, ...] = AGGREGATE_FEATURE_NAMES + REQUEST_FEATURE_NAMES + SLOT_FEATURE_NAMES
 
-# Feature presets: ``v1`` uses aggregates only (works on any FPM stream),
-# ``sglang18`` / ``hisim`` need per-request lists, ``all`` is the union.
+# Atomic per-request feature sets: the smallest subsets of the 18 from which all
+# 18 can be computed back (docs/fpm_ml/design.md §3.1). Prefill: the ten that are
+# not functions of the others. Decode: every request extends by one token, so
+# Σe = n, max e = min e = 1, Σe² = n and Σe·p = Σp, and five remain.
+ATOMIC_PREFILL_FEATURE_NAMES: tuple[str, ...] = (
+    "req_batch_size",
+    "req_sum_extend",
+    "req_max_extend",
+    "req_min_extend",
+    "req_sum_past",
+    "req_max_past",
+    "req_min_past",
+    "req_sum_extend_x_past",
+    "req_sum_extend_squared",
+    "req_sum_past_squared",
+)
+ATOMIC_DECODE_FEATURE_NAMES: tuple[str, ...] = (
+    "req_batch_size",
+    "req_sum_past",
+    "req_max_past",
+    "req_min_past",
+    "req_sum_past_squared",
+)
+
+# Feature presets: ``v1`` uses aggregates only (works on any FPM stream);
+# ``atomic5`` / ``atomic10`` / ``sglang18`` / ``hisim`` need per-request lists;
+# ``all`` is the union. ``sglang18`` is the full SGLang-simulator set the atomic
+# sets were derived from; it is kept for comparison and for prefill models that
+# must extrapolate to traffic unlike their training data (design.md §8.8).
 FEATURE_PRESETS: dict[str, tuple[str, ...]] = {
     "v1": AGGREGATE_FEATURE_NAMES,
+    "atomic5": ATOMIC_DECODE_FEATURE_NAMES,
+    "atomic10": ATOMIC_PREFILL_FEATURE_NAMES,
     "sglang18": REQUEST_FEATURE_NAMES,
     "hisim": ("req_batch_size",) + SLOT_FEATURE_NAMES,
     "all": FEATURE_NAMES,
 }
-# Default = the 18 per-request features (SGLang simulator / HiSim lineage); the
-# producer must emit extend_lengths / past_kv_lengths. Aggregate-only streams
+# Defaults: the atomic set of the worker role. A decode worker sees one token per
+# request per step (not valid with speculative decoding: use ``atomic10`` or
+# ``sglang18`` there); prefill and aggregated (mixed) workers use the ten. The
+# producer must emit extend_lengths / past_kv_lengths; aggregate-only streams
 # need an explicit ``--features v1``.
 DEFAULT_FEATURES: dict[str, tuple[str, ...]] = {
-    "decode": REQUEST_FEATURE_NAMES,
-    "prefill": REQUEST_FEATURE_NAMES,
-    "aggregated": REQUEST_FEATURE_NAMES,
+    "decode": ATOMIC_DECODE_FEATURE_NAMES,
+    "prefill": ATOMIC_PREFILL_FEATURE_NAMES,
+    "aggregated": ATOMIC_PREFILL_FEATURE_NAMES,
+}
+DEFAULT_FEATURE_PRESET: dict[str, str] = {
+    "decode": "atomic5",
+    "prefill": "atomic10",
+    "aggregated": "atomic10",
 }
 
 MIN_POSITIVE_PREDICTION_MS = 1e-6
@@ -822,7 +858,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
             "join_ranks": args.join_ranks,
             "train_iterations": len(train_set),
             "holdout_iterations": len(holdout),
-            "features_preset": args.features,
+            "features_preset": args.features or DEFAULT_FEATURE_PRESET[args.worker_type],
         },
     )
     out = Path(args.out)
@@ -867,7 +903,8 @@ def _build_parser() -> argparse.ArgumentParser:
     tr.add_argument(
         "--features",
         default=None,
-        help="preset (v1 | sglang18 | hisim | all) or comma-separated feature names; default: sglang18",
+        help="preset (v1 | atomic5 | atomic10 | sglang18 | hisim | all) or comma-separated feature names; "
+        "default: atomic5 for decode, atomic10 for prefill / aggregated",
     )
     tr.add_argument("--target", choices=TARGETS, default="log_ms")
     tr.add_argument("--max-iter", type=int, default=600)

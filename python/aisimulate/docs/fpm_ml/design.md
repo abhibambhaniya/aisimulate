@@ -166,7 +166,9 @@ The feature space is a fixed 135-name ABI; an artifact lists the names it reads
 | Preset | Slots | Source |
 | --- | --- | --- |
 | `v1` | 21 aggregates + their `log1p` and derived ratios | stock FPM v1, no lists needed |
-| `sglang18` (default) | the 18 per-request features below | per-request lists |
+| `atomic5` (default for decode workers) | n, Σp, max p, min p, Σp²: the atomic set of a decode step (§3.1) | per-request lists |
+| `atomic10` (default for prefill and aggregated workers) | n, Σe, max e, min e, Σp, max p, min p, Σe·p, Σe², Σp²: the atomic set of the 18 (§3.1) | per-request lists |
+| `sglang18` | the 18 per-request features below; the set the atomic ones were derived from, kept for comparison and for prefill models that must extrapolate across workloads | per-request lists |
 | `hisim` | `req_batch_size` + 32 request slots × (present, past, extend), requests sorted by past descending | per-request lists |
 
 The `sglang18` set is the feature definition of the SGLang simulator's
@@ -208,8 +210,8 @@ train/test pair, so decode uses the 5. Prefill: the 10 atomic features are equal
 in-distribution (every same-workload cell within 0.05 pp), so prefill uses the 10. The one
 caveat: a GBDT cannot form products, and when the training workload differs from the
 simulated one the missing derived axis n · Σe costs 2–35 pp on cross-workload pairs
-(§8.8 b); for that use the 18. The shipped default stays at 18 for both roles; the atomic
-sets are selected with `--features`.
+(§8.8 b); for that train with `--features sglang18`. The shipped defaults are the atomic
+sets: `atomic5` for decode workers, `atomic10` for prefill and aggregated workers.
 
 | role | atomic features | count | vs 18 features |
 | --- | --- | --- | --- |
@@ -276,9 +278,8 @@ Reading the tables:
   versus 4.6–5.3 µs. The feature build is a few hundred nanoseconds; the time is the
   400-tree walk, and trees fitted on fewer axes are not shallower.
 
-The shipped default is `sglang18` for both roles. A reduced model is trained by listing the
-names: `--features req_batch_size,req_sum_past,req_max_past,req_min_past,req_sum_past_squared`
-for decode. Raw output:
+The shipped defaults are the atomic sets (`atomic5` decode, `atomic10` prefill /
+aggregated); `--features sglang18` selects the 18. Raw output:
 `feature_ablation_*.txt` and `estimator_latency_by_feature_set.csv` in the playground
 `reports/`.
 
@@ -813,16 +814,18 @@ Four findings support this:
    (LongBench-trained → ShareGPT 29 % → 69 %), because the trees cannot rebuild n · Σe
    (§3.1, §8.8 b). For a model trained on the traffic it will simulate, 10 is the set.
 
-Training the recommended models needs no code change:
+The atomic sets are the trainer's default features (`atomic5` for `--worker-type decode`,
+`atomic10` otherwise). The tree size is set on the command line:
 
 ```
-# decode, 5 atomic features
---features req_batch_size,req_sum_past,req_max_past,req_min_past,req_sum_past_squared --max-iter 100 --learning-rate 0.2 --max-leaf-nodes 7
-# prefill, 10 atomic features
---features req_batch_size,req_sum_extend,req_max_extend,req_min_extend,req_sum_past,req_max_past,req_min_past,req_sum_extend_x_past,req_sum_extend_squared,req_sum_past_squared --max-iter 100 --learning-rate 0.2 --max-leaf-nodes 15
+# decode (features default to atomic5)
+--max-iter 100 --learning-rate 0.2 --max-leaf-nodes 7
+# prefill (features default to atomic10)
+--max-iter 100 --learning-rate 0.2 --max-leaf-nodes 15
 ```
 
-The shipped defaults are unchanged. What follows is the evidence.
+The CLI's tree-size defaults (600 trees, lr 0.05, 31 leaves) are unchanged. What follows
+is the evidence.
 
 **Method.** Smaller models are trained with the existing CLI options (`--max-iter`,
 `--learning-rate`, `--max-leaf-nodes`, `--features`). The learning rate is raised as the
@@ -832,11 +835,11 @@ prefill 10} × trees {400, 200, 100, 50} × leaves {31, 15, 7}.
 **Accuracy on the GB300 SGLang data** (ten runs; same 4 × 3 layout as §3.1: rows = training
 data, columns = test data; diagonal and last row use the 60/40 time split, other cells
 train on every run of the row workload and test on every run of the column workload;
-MAPE %). One table per configuration; the first in each group is the shipped default.
+MAPE %). One table per configuration; the first in each group is the 18-feature, 400 × 31 reference.
 
 Decode:
 
-18 features, 400 trees × 31 leaves, lr 0.05 (default)
+18 features, 400 trees × 31 leaves, lr 0.05 (reference)
 
 | train \\ test | AgentX | ShareGPT | LongBench |
 | --- | --- | --- | --- |
@@ -883,7 +886,7 @@ Decode:
 
 Prefill:
 
-18 features, 400 trees × 31 leaves, lr 0.05 (default)
+18 features, 400 trees × 31 leaves, lr 0.05 (reference)
 
 | train \\ test | AgentX | ShareGPT | LongBench |
 | --- | --- | --- | --- |

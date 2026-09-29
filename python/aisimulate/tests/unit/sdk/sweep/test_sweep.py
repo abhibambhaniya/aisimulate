@@ -505,6 +505,52 @@ def test_sweep_agg_prefix_grid_covers_every_batch_and_mirrors_legacy(monkeypatch
     assert legacy_points == points
 
 
+@pytest.mark.parametrize("prefix", [2048, 2049])
+def test_sweep_agg_rejects_prefix_at_or_beyond_isl_before_the_grid(monkeypatch, prefix):
+    """run_agg rejects a request with no uncached token, so both agg sweeps
+    must fail up front, before any grid point is estimated, rather than at
+    their first run_agg call."""
+    from aisimulate.sdk.backends.factory import get_backend
+
+    runtime_config = config.RuntimeConfig(isl=2048, osl=64, prefix=prefix, ttft=1e9, tpot=1e9)
+
+    points: list[tuple[int, int]] = []
+    monkeypatch.setattr(sweep, "predict_agg_worker", _recording_agg_worker(points))
+    with pytest.raises(ValueError, match=r"prefix \(\d+\) must be smaller than the effective isl \(2048\)"):
+        sweep._sweep_one_parallel_agg(
+            model=MagicMock(),
+            backend=MagicMock(),
+            database=MagicMock(),
+            runtime_config=runtime_config,
+            top_k=0,
+            max_batch_size=8,
+            ctx_stride=512,
+            enable_chunked_prefill=False,
+            free_gpu_memory_fraction=None,
+            max_seq_len=None,
+        )
+    assert points == []
+
+    legacy_backend = get_backend("sglang")
+    legacy_calls: list[int] = []
+    monkeypatch.setattr(
+        legacy_backend,
+        "run_agg",
+        lambda model, database, runtime_config, **kwargs: legacy_calls.append(kwargs["ctx_tokens"]),
+    )
+    with pytest.raises(ValueError, match=r"prefix \(\d+\) must be smaller than the effective isl \(2048\)"):
+        legacy_backend.find_best_agg_result_under_constraints(
+            MagicMock(),
+            MagicMock(),
+            runtime_config,
+            top_k=0,
+            max_batch_size=8,
+            ctx_stride=512,
+            enable_chunked_prefill=False,
+        )
+    assert legacy_calls == []
+
+
 # ---------------------------------------------------------------------------
 # sweep_disagg validation
 # ---------------------------------------------------------------------------

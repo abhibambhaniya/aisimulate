@@ -337,7 +337,12 @@ def _sweep_one_parallel_agg(
     isl = runtime_config.isl + BaseBackend._visual_context_tokens(model, runtime_config)
     # ctx_tokens budgets UNCACHED prefill tokens (run_agg's isl_new), so the
     # feasibility guards and the capped-gen dedup pack requests by it.
-    isl_new = max(isl - int(runtime_config.prefix or 0), 1)
+    # run_agg rejects a request with no uncached token; fail before the grid
+    # is built instead of at its first point.
+    prefix = int(runtime_config.prefix or 0)
+    if prefix >= isl:
+        raise ValueError(f"prefix ({prefix}) must be smaller than the effective isl ({isl}) for an agg sweep")
+    isl_new = isl - prefix
     osl = runtime_config.osl
     ttft_target = runtime_config.ttft
     tpot_target = runtime_config.tpot

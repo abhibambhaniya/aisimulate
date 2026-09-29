@@ -167,10 +167,11 @@ mod tests {
     use crate::operators::op::{FallbackOp, OverlapOp};
     use crate::operators::{
         ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp,
-        Dsv4ModuleOp, ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp,
-        GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp,
-        MlaModuleOp, MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp, MoeOp, NcclOp, P2POp,
-        VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp,
+        Dsv4ModuleOp, Dsv41AttentionOp, Dsv41EngramOp, Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp,
+        ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
+        GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp,
+        MoeAllToAllOp, MoeExpertComputeOp, MoeOp, NcclOp, P2POp, VisionEncoderOp,
+        WideEpContextMlaOp, WideEpGenerationMlaOp,
     };
     use crate::perf_database::dsv4::AttnKind;
     use crate::{
@@ -318,6 +319,7 @@ mod tests {
             workload_distribution: "power_law_1.2".into(),
             is_gated: true,
             moe_backend: None,
+            moe_kernel_source: Some("sglang_flashinfer_trtllm_moe".into()),
             enable_eplb: false,
             is_context: false,
         }
@@ -641,6 +643,7 @@ mod tests {
             weight_bytes: 1.5e10,
             // Non-default on purpose: the round-trip must preserve the field.
             verify_width: 8,
+            original_fmha_quant_mode: Some("fp8".into()),
             sol_ops: vec![
                 OpSpec::Gemm(gemm()),
                 OpSpec::ContextAttention(context_attention()),
@@ -711,6 +714,57 @@ mod tests {
                 numerator: 5,
                 denominator: 6,
             }),
+            OpSpec::Dsv41Attention(Dsv41AttentionOp {
+                name: "v41_attention".into(),
+                is_context: true,
+                role: "full".into(),
+                compress_ratio: 2,
+                hidden_size: 5120,
+                num_heads: 16,
+                head_dim: 512,
+                q_lora_rank: 1280,
+                o_lora_rank: 1024,
+                o_groups: 2,
+                index_n_heads: 8,
+                index_head_dim: 128,
+                index_topk: 512,
+                window_size: 128,
+                candidate_limit: 0,
+                is_candidate_source: false,
+                bounded_prefill: false,
+                gemm_quant_mode: GemmQuantMode::Fp8Block,
+                fmha_quant_mode: FmhaQuantMode::Fp8,
+                kv_cache_layout: crate::operators::dsv41::Dsv41KvCacheLayout::SglangFp8Bf16,
+            }),
+            OpSpec::Dsv41Mhc(Dsv41MhcOp {
+                name: "v41_mhc".into(),
+                hidden_size: 5120,
+                hc_mult: 4,
+                sinkhorn_iters: 20,
+            }),
+            OpSpec::Dsv41Engram(Dsv41EngramOp {
+                name: "v41_engram".into(),
+                num_embeddings: 384006168,
+                head_dim: 256,
+                hash_columns: 24,
+                hidden_size: 5120,
+                hc_mult: 4,
+                tp_size: 4,
+            }),
+            OpSpec::Dsv41Stage(Dsv41StageOp {
+                name: "v41_stage".into(),
+                is_context: true,
+                decoder_replay: true,
+                bounded: true,
+                window_size: 128,
+                children: vec![OpSpec::Gemm(gemm())],
+            }),
+            OpSpec::Dsv41Linear(Dsv41LinearOp {
+                name: "v41_linear".into(),
+                n: 1152,
+                k: 5120,
+                quant_mode: GemmQuantMode::Fp8Block,
+            }),
         ];
 
         // Exhaustiveness guard: if a variant is added to `Op`, this match
@@ -752,6 +806,11 @@ mod tests {
                 | OpSpec::Kda(_)
                 | OpSpec::MoeAllToAll(_)
                 | OpSpec::MoeExpertCompute(_)
+                | OpSpec::Dsv41Attention(_)
+                | OpSpec::Dsv41Mhc(_)
+                | OpSpec::Dsv41Engram(_)
+                | OpSpec::Dsv41Stage(_)
+                | OpSpec::Dsv41Linear(_)
                 | OpSpec::TokenScale(_) => {}
             }
         }
@@ -767,6 +826,9 @@ mod tests {
             backend: crate::BackendKind::Trtllm,
             backend_version: Some("1.0.0rc3".into()),
             forward_model: None,
+            fpm_parquet_path: None,
+            decoder_replay: false,
+            moe_kernel_source: None,
             kv_block_size: Some(64),
             parallel: ParallelMapping {
                 dcp_size: None,
@@ -781,6 +843,7 @@ mod tests {
                 weight_dtype: Some(DataType::Fp8),
                 moe_dtype: Some(DataType::Fp8),
                 activation_dtype: Some(DataType::Fp8),
+                fpm_fmha_dtype: None,
                 kv_cache_dtype: Some(DataType::Fp8),
             },
             speculative: Some(SpeculativeConfig { nextn: Some(1) }),
@@ -843,8 +906,15 @@ mod tests {
         // Appending is the only safe growth direction.
         assert_eq!(MOE_EXPERT_COMPUTE_INDEX, MOE_ALL_TO_ALL_INDEX + 1);
         assert_eq!(TOKEN_SCALE_INDEX, MOE_EXPERT_COMPUTE_INDEX + 1);
+        // Keep the main-branch TokenScale index; V41 variants append after it.
+        let appended: Vec<_> = all_op_variants().iter().skip(36).map(index_of).collect();
         assert_eq!(
-            TOKEN_SCALE_INDEX as usize + 1,
+            appended,
+            vec![36, 37, 38, 39, 40],
+            "V41 appended indices moved"
+        );
+        assert_eq!(
+            TOKEN_SCALE_INDEX as usize + 6,
             all_op_variants().len(),
             "all_op_variants() must cover exactly the pinned variant count"
         );
@@ -917,6 +987,32 @@ mod tests {
         let bytes = spec.to_bincode().expect("to_bincode");
         let decoded = EngineSpec::from_bincode(&bytes).expect("from_bincode");
         assert_eq!(spec, decoded);
+    }
+
+    #[test]
+    fn moe_and_fpm_fields_round_trip_and_reject_concurrent_schema20() {
+        // These independent positional fields were both introduced as schema20
+        // on separate branches. The merged wire layout needs its own version.
+        let spec = EngineSpec::new(
+            sample_engine_config(),
+            vec![OpSpec::FpmForward(fpm_forward())],
+            vec![OpSpec::Moe(moe())],
+        );
+        assert_eq!(spec.schema_version, 22);
+        let mut bytes = spec.to_bincode().unwrap();
+        assert_eq!(EngineSpec::from_bincode(&bytes).unwrap(), spec);
+
+        bytes[..4].copy_from_slice(&20u32.to_le_bytes());
+        // Reject the stale version before even trying to decode its payload.
+        bytes.truncate(4);
+        assert!(matches!(
+            EngineSpec::from_bincode(&bytes),
+            Err(AicError::UnsupportedSchemaVersion {
+                kind: "EngineSpec",
+                got: 20,
+                expected: ENGINE_SPEC_SCHEMA_VERSION,
+            })
+        ));
     }
 
     /// A version skew combined with an op-layout change must surface as a clear
@@ -1020,6 +1116,37 @@ mod tests {
             }
             other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
         }
+    }
+
+    /// The backend layout is positional even though legacy JSON has a default.
+    #[test]
+    fn dsv41_layout_round_trip_and_stale_v18_payload_rejection() {
+        let attention = all_op_variants()
+            .into_iter()
+            .find(|op| matches!(op, OpSpec::Dsv41Attention(_)))
+            .unwrap();
+        let spec = EngineSpec::new(sample_engine_config(), vec![], vec![attention]);
+        let mut bytes = spec.to_bincode().unwrap();
+        assert_eq!(EngineSpec::from_bincode(&bytes).unwrap(), spec);
+        // SglangFp8Bf16 is enum1 (four bytes), the final field of the final op.
+        // Removing it restores the actual prior Dsv41Attention schema18 shape.
+        assert_eq!(&bytes[bytes.len() - 4..], &1u32.to_le_bytes());
+        bytes.truncate(bytes.len() - 4);
+        bytes[..4].copy_from_slice(&18u32.to_le_bytes());
+        assert!(matches!(
+            EngineSpec::from_bincode(&bytes),
+            Err(AicError::UnsupportedSchemaVersion {
+                kind: "EngineSpec",
+                got: 18,
+                expected: ENGINE_SPEC_SCHEMA_VERSION
+            })
+        ));
+        // A false current-schema stamp cannot silently use the JSON-only default.
+        bytes[..4].copy_from_slice(&ENGINE_SPEC_SCHEMA_VERSION.to_le_bytes());
+        assert!(matches!(
+            EngineSpec::from_bincode(&bytes),
+            Err(AicError::EngineSpec(_))
+        ));
     }
 
     /// v11 -> v12 regression (PR-6): `DsaModuleOp` gained
@@ -1173,6 +1300,28 @@ mod tests {
         ));
     }
     #[test]
+    fn fpm_selector_json_default_and_schema19_rejection() {
+        let selected = fpm_forward();
+        assert_eq!(selected.original_fmha_quant_mode.as_deref(), Some("fp8"));
+        let mut json = serde_json::to_value(selected).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("original_fmha_quant_mode");
+        let legacy: crate::operators::FpmForwardOp = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.original_fmha_quant_mode, None);
+        let mut bytes = handshake_spec().to_bincode().unwrap();
+        bytes[..4].copy_from_slice(&19u32.to_le_bytes());
+        bytes.truncate(4);
+        assert!(matches!(
+            EngineSpec::from_bincode(&bytes),
+            Err(AicError::UnsupportedSchemaVersion {
+                got: 19,
+                expected: ENGINE_SPEC_SCHEMA_VERSION,
+                ..
+            })
+        ));
+    }
+    #[test]
     fn recorded_dcp_and_legacy_absence_round_trip() {
         let mut spec = handshake_spec();
         spec.engine.parallel.dcp_size = Some(2);
@@ -1182,5 +1331,11 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("dcp_size");
         let legacy: EngineConfig = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.parallel.dcp_size, None);
+        let mut previous = spec.to_bincode().unwrap();
+        previous[..4].copy_from_slice(&21u32.to_le_bytes());
+        assert!(matches!(
+            EngineSpec::from_bincode(&previous),
+            Err(AicError::UnsupportedSchemaVersion { got: 21, .. })
+        ));
     }
 }

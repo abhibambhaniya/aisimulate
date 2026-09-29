@@ -7,17 +7,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{
-    Backend, EngineConfig, TimingEvidenceSource, TimingEvidenceSummary, TimingModel,
-    TimingModelConfig, TimingOperationEvidence, TimingPhaseEvidence,
+    Backend, EngineConfig, TimingEvidenceAccumulator, TimingEvidenceSource, TimingEvidenceSummary,
+    TimingModel, TimingModelConfig, TimingOperationEvidence, TimingPhaseEvidence,
+    ValidatedTimingPhase,
 };
+use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
     POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
     ReplayEngineConfig, ReplayEngineFactory, ReplayOperationPowerDiagnostics,
     ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics, ReplayRoleConfig, ReplayRuntimeInput,
     ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
     loadgen::{
-        ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace,
-        WekaImportOptions, WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
+        AgenticSnapshotOptions, ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec,
+        SyntheticTraceSpec, Trace, ValidatedAgenticGraph, WekaImportOptions,
+        WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
         load_agentic_mooncake, load_weka_agentic_graph_with_options,
     },
 };
@@ -36,7 +39,10 @@ use serde::Deserialize;
 enum ExecutionPayload {
     Configured {
         spec: ReplaySpec,
-        traffic: Box<RuntimeTraffic>,
+        #[serde(default)]
+        traffic: Option<Box<RuntimeTraffic>>,
+        #[serde(default)]
+        capture_performance_diagnostics: bool,
     },
     Legacy(ReplaySpec),
 }
@@ -68,9 +74,15 @@ struct RuntimeTraffic {
     #[serde(default)]
     agentic_lanes: Option<usize>,
     #[serde(default)]
+    agentic_snapshot: Option<AgenticSnapshotOptions>,
+    #[serde(default)]
+    agentic_warmup: bool,
+    #[serde(default)]
     isl: Option<usize>,
     #[serde(default)]
     osl: Option<usize>,
+    #[serde(default)]
+    cached_prefix_tokens: Option<usize>,
     #[serde(default)]
     request_count: Option<usize>,
     #[serde(default)]
@@ -132,15 +144,15 @@ fn validate_public_agentic_engine(input: &ReplayRuntimeInput, rank: &EngineConfi
     }
     ensure!(
         matches!(rank.backend, Backend::Vllm | Backend::Sglang),
-        "agentic M1 execution supports only vLLM and SGLang backends"
+        "agentic replay supports only vLLM and SGLang backends"
     );
     ensure!(
         rank.native_host_offload.is_none(),
-        "agentic M1 execution requires HBM-only KV cache; host offload is unsupported"
+        "agentic replay requires HBM-only KV cache; host offload is unsupported"
     );
     ensure!(
         rank.aic_nextn.is_none(),
-        "agentic M1 execution requires speculative decoding disabled"
+        "agentic replay requires speculative decoding disabled"
     );
     Ok(())
 }
@@ -171,6 +183,8 @@ struct AicTimingConfig {
     moe_dtype: Option<String>,
     #[serde(default, alias = "fmha_quant_mode")]
     fmha_dtype: Option<String>,
+    #[serde(default, alias = "fpm_fmha_quant_mode")]
+    fpm_fmha_dtype: Option<String>,
     #[serde(default, alias = "kvcache_quant_mode")]
     kv_cache_dtype: Option<String>,
     #[serde(default, alias = "comm_quant_mode")]
@@ -194,6 +208,10 @@ struct AicTimingConfig {
     #[serde(default)]
     forward_model: Option<String>,
     #[serde(default)]
+    fpm_parquet_path: Option<String>,
+    #[serde(default)]
+    decoder_replay: bool,
+    #[serde(default)]
     worker_type: Option<ForwardPassWorkerType>,
     #[serde(default)]
     estimation_mode: Option<EstimationMode>,
@@ -210,6 +228,14 @@ struct AicTimingConfig {
     #[serde(default)]
     attention_backend: Option<String>,
     #[serde(default)]
+    moe_kernel_source: Option<String>,
+    #[serde(default)]
+    moe_backend: Option<String>,
+    #[serde(default)]
+    enable_eplb: bool,
+    #[serde(default)]
+    wideep_num_slots: Option<u32>,
+    #[serde(default, alias = "shared_layer")]
     enable_shared_layer: Option<bool>,
     #[serde(default)]
     strict_provenance: bool,
@@ -254,6 +280,21 @@ impl AicTimingConfig {
         } else {
             self.systems_paths.clone()
         };
+        let mut estimator_config = self.estimator_config.clone();
+        if let Some(path) = &self.fpm_parquet_path {
+            crate::config::validate_fpm_parquet_path(
+                Some(std::path::Path::new(path)),
+                mode == EstimationMode::FpmInterpolation,
+            )?;
+            let configured = &mut estimator_config.fpm_interpolation.fpm_parquet_path;
+            ensure!(
+                configured
+                    .as_ref()
+                    .is_none_or(|existing| existing == std::path::Path::new(path)),
+                "conflicting fpm_parquet_path and estimator_config.fpm_interpolation.fpm_parquet_path"
+            );
+            *configured = Some(path.into());
+        }
         Ok(ForwardPassPerfModelConfig {
             model: self.model.clone(),
             system: self.system.clone(),
@@ -269,18 +310,24 @@ impl AicTimingConfig {
             gemm_quant_mode: self.gemm_dtype.clone(),
             moe_quant_mode: self.moe_dtype.clone(),
             fmha_quant_mode: self.fmha_dtype.clone(),
+            fpm_fmha_quant_mode: self.fpm_fmha_dtype.clone(),
             kvcache_quant_mode: self.kv_cache_dtype.clone(),
             comm_quant_mode: self.comm_dtype.clone(),
             nextn: self.nextn,
             speculation: self.speculation.clone(),
             kv_block_size: self.kv_block_size,
+            decoder_replay: self.decoder_replay,
             estimation_mode: mode,
             fallback_policy: self.fallback_policy,
-            estimator_config: self.estimator_config.clone(),
+            estimator_config,
             database_mode: self.database_mode,
             transfer_policy: self.transfer_policy.clone(),
             systems_paths: roots,
             attention_backend: self.attention_backend.clone(),
+            moe_backend: self.moe_backend.clone(),
+            enable_eplb: self.enable_eplb,
+            wideep_num_slots: self.wideep_num_slots,
+            moe_kernel_source: self.moe_kernel_source.clone(),
             enable_shared_layer: self.enable_shared_layer,
             strict_provenance: self.strict_provenance,
         })
@@ -374,12 +421,28 @@ impl AicTimingConfig {
 
 type PhaseEvidenceKey = (u32, u32, u32, u32, bool);
 
+#[cfg(test)]
+type PythonPerOpEntries = Vec<(String, f64, f64, String)>;
+
+enum AicPhaseProvider {
+    Native(Arc<PerfEngine>),
+    /// Keep the original bridge as an independent test reference and probe seam.
+    #[cfg(test)]
+    Python,
+    /// Inject native rows to test construction failures before cache publication.
+    #[cfg(test)]
+    NativeEntries(Vec<crate::perfmodel::engine::PerOpValue>),
+}
+
 struct AicTimingModel {
     engine: Py<PyAny>,
+    diagnostic_model: Option<ForwardPassPerfModel>,
+    decoder_replay: bool,
+    phase_provider: AicPhaseProvider,
     use_fpm_decode_totals: bool,
     fpm_decode_kv_ceiling: Option<u32>,
-    evidence: Mutex<TimingEvidenceSummary>,
-    phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, TimingPhaseEvidence>,
+    evidence: Mutex<TimingEvidenceAccumulator>,
+    phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
 }
 
 impl AicTimingModel {
@@ -402,6 +465,7 @@ impl AicTimingModel {
         config.estimation_mode = Some(provenance.selected_estimation_mode);
         config.worker_type = Some(worker_type);
         config.forward_model = None;
+        config.fpm_parquet_path = None;
         config.fallback_policy = ForwardPassFallbackPolicy::Deny;
         config.estimator_config = provenance.config.estimator_config.clone();
         let use_fpm_decode_totals =
@@ -409,6 +473,7 @@ impl AicTimingModel {
         let native = model.native_engine().context(
             "AIC regression estimator is not ready: offline replay requires trained observations or a native estimator"
         )?;
+        let phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
         let (engine, fpm_decode_kv_ceiling) = Python::with_gil(|py| -> PyResult<_> {
             let engine = Py::new(py, crate::AicEngine::from_shared_engine(native))?.into_any();
             let ceiling = if use_fpm_decode_totals {
@@ -423,9 +488,12 @@ impl AicTimingModel {
         })?;
         Ok(Self {
             engine,
+            diagnostic_model: Some(model),
+            decoder_replay: config.decoder_replay,
+            phase_provider,
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling,
-            evidence: Mutex::new(TimingEvidenceSummary::default()),
+            evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             phase_cache: quick_cache::sync::Cache::new(128),
         })
     }
@@ -437,16 +505,106 @@ impl AicTimingModel {
         osl: u32,
         prefix: u32,
         mode: &str,
-    ) -> Result<TimingPhaseEvidence> {
+    ) -> Result<Arc<ValidatedTimingPhase>> {
         let prefill = mode == "static_ctx";
         if batch_size == 0 || (prefill && isl <= prefix) {
-            return Ok(TimingPhaseEvidence::default());
+            static EMPTY: std::sync::OnceLock<Arc<ValidatedTimingPhase>> =
+                std::sync::OnceLock::new();
+            return Ok(Arc::clone(EMPTY.get_or_init(Default::default)));
         }
         let key = (batch_size, isl, osl, prefix, prefill);
         if let Some(phase) = self.phase_cache.get(&key) {
             return Ok(phase);
         }
-        let (context, generation) = Python::with_gil(|py| {
+        if let Some(model) = &self.diagnostic_model {
+            let entries = model.static_phase_diagnostics(batch_size, isl, prefix, prefill)?;
+            ensure!(
+                !entries.is_empty(),
+                "AIC {mode} returned empty operation diagnostics for nonzero work"
+            );
+            let operations = entries
+                .into_iter()
+                .map(|entry| {
+                    let mut operation = TimingOperationEvidence::new(
+                        entry.name,
+                        entry.latency_ms,
+                        Some(entry.energy_wms),
+                        TimingEvidenceSource::from_provider(entry.source),
+                    )?;
+                    operation.details = Some(entry.details);
+                    Ok(operation)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let phase = Arc::new(ValidatedTimingPhase::from_operations(operations)?);
+            self.phase_cache.insert(key, Arc::clone(&phase));
+            return Ok(phase);
+        }
+        let phase = match &self.phase_provider {
+            #[cfg(test)]
+            AicPhaseProvider::NativeEntries(entries) => {
+                ensure!(
+                    !entries.is_empty(),
+                    "AIC {mode} returned empty operation evidence for nonzero work"
+                );
+                phase_evidence_from_native_entries(entries.clone())?
+            }
+            AicPhaseProvider::Native(engine) => {
+                let runtime = RuntimeConfig {
+                    batch_size,
+                    beam_width: 1,
+                    isl,
+                    osl,
+                    prefix,
+                    seq_imbalance_correction_scale: 1.0,
+                    gen_seq_imbalance_correction_scale: 1.0,
+                };
+                let (context, generation) = crate::py::parse_mode(mode)
+                    .and_then(|mode| {
+                        engine.reset_provenance();
+                        engine
+                            .run_static_per_op(
+                                &runtime,
+                                mode,
+                                crate::perfmodel::engine::DEFAULT_STATIC_STRIDE,
+                            )
+                            .map_err(crate::py::aic_to_py)
+                    })
+                    .map_err(|error| anyhow!("AIC {mode} evidence prediction failed: {error}"))?;
+                let entries = if prefill { context } else { generation };
+                ensure!(
+                    !entries.is_empty(),
+                    "AIC {mode} returned empty operation evidence for nonzero work"
+                );
+                phase_evidence_from_native_entries(entries)?
+            }
+            #[cfg(test)]
+            AicPhaseProvider::Python => {
+                let (context, generation) = self
+                    .phase_evidence_through_python(batch_size, isl, osl, prefix, mode)
+                    .map_err(|error| anyhow!("AIC {mode} evidence prediction failed: {error}"))?;
+                let entries = if prefill { context } else { generation };
+                ensure!(
+                    !entries.is_empty(),
+                    "AIC {mode} returned empty operation evidence for nonzero work"
+                );
+                phase_evidence_from_entries(entries)?
+            }
+        };
+        let phase = Arc::new(phase);
+        self.phase_cache.insert(key, Arc::clone(&phase));
+        Ok(phase)
+    }
+
+    #[cfg(test)]
+    fn phase_evidence_through_python(
+        &self,
+        batch_size: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        mode: &str,
+    ) -> PyResult<(PythonPerOpEntries, PythonPerOpEntries)> {
+        Python::with_gil(|py| {
             let kwargs = PyDict::new(py);
             kwargs.set_item("batch_size", batch_size)?;
             kwargs.set_item("beam_width", 1)?;
@@ -456,43 +614,48 @@ impl AicTimingModel {
             kwargs.set_item("seq_imbalance_correction_scale", 1.0)?;
             kwargs.set_item("gen_seq_imbalance_correction_scale", 1.0)?;
             kwargs.set_item("mode", mode)?;
-            kwargs.set_item("stride", 32)?;
+            kwargs.set_item("stride", crate::perfmodel::engine::DEFAULT_STATIC_STRIDE)?;
             self.engine
                 .bind(py)
                 .call_method("run_static_per_op", (), Some(&kwargs))?
-                .extract::<(
-                    Vec<(String, f64, f64, String)>,
-                    Vec<(String, f64, f64, String)>,
-                )>()
+                .extract::<(PythonPerOpEntries, PythonPerOpEntries)>()
         })
-        .map_err(|error| anyhow!("AIC {mode} evidence prediction failed: {error}"))?;
-        let entries = if prefill { context } else { generation };
-        ensure!(
-            !entries.is_empty(),
-            "AIC {mode} returned empty operation evidence for nonzero work"
-        );
-        let phase = phase_evidence_from_python(entries)?;
-        self.phase_cache.insert(key, phase.clone());
-        Ok(phase)
     }
 
-    fn record_evidence(&self, phase: TimingPhaseEvidence, prefill: bool) -> Result<()> {
+    fn record_evidence(&self, phase: &ValidatedTimingPhase, prefill: bool) -> Result<()> {
         let mut evidence = self
             .evidence
             .lock()
             .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))?;
-        if prefill {
-            evidence.prefill.try_accumulate(phase)?;
-        } else {
-            evidence.decode.try_accumulate(phase)?;
-        }
-        Ok(())
+        evidence.record(phase, prefill)
     }
 }
 
-fn phase_evidence_from_python(
+fn phase_evidence_from_native_entries(
+    entries: Vec<crate::perfmodel::engine::PerOpValue>,
+) -> Result<ValidatedTimingPhase> {
+    let operations = entries
+        .into_iter()
+        .map(|(name, latency_ms, energy_wms, source)| {
+            ensure!(
+                energy_wms.is_finite() && energy_wms >= 0.0,
+                "AIC operation {name:?} returned invalid energy {energy_wms}W-ms"
+            );
+            TimingOperationEvidence::new(
+                name,
+                latency_ms,
+                Some(energy_wms),
+                TimingEvidenceSource::from_native(source),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ValidatedTimingPhase::from_name_folded_operations(operations)
+}
+
+#[cfg(test)]
+fn phase_evidence_from_entries(
     entries: Vec<(String, f64, f64, String)>,
-) -> Result<TimingPhaseEvidence> {
+) -> Result<ValidatedTimingPhase> {
     let operations = entries
         .into_iter()
         .map(|(name, latency_ms, energy_wms, source)| {
@@ -508,10 +671,25 @@ fn phase_evidence_from_python(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    TimingPhaseEvidence::try_from_operations(operations)
+    ValidatedTimingPhase::from_operations(operations)
 }
 
 impl TimingModel for AicTimingModel {
+    fn prefill_batch_validation_can_fail(&self) -> bool {
+        self.decoder_replay
+    }
+
+    fn validate_prefill_batch(&self, requests: &[(usize, usize)]) -> Result<()> {
+        if self.decoder_replay {
+            ensure!(
+                requests.windows(2).all(|pair| pair[0] == pair[1]),
+                "decoder replay requires identical per-request new-token and cached-prefix lengths; \
+                 heterogeneous prefill cannot be represented by the mean-based replay timing API"
+            );
+        }
+        Ok(())
+    }
+
     fn predict_prefill_ms(
         &self,
         batch_size: usize,
@@ -524,8 +702,8 @@ impl TimingModel for AicTimingModel {
         if !self.use_fpm_decode_totals {
             let evidence =
                 self.predict_phase_evidence(batch_size, mean_isl, 1, mean_prefix, "static_ctx")?;
-            let latency_ms = evidence.latency_ms;
-            self.record_evidence(evidence, true)?;
+            let latency_ms = evidence.as_phase().latency_ms;
+            self.record_evidence(&evidence, true)?;
             return Ok(latency_ms);
         }
         Python::with_gil(|py| {
@@ -567,11 +745,16 @@ impl TimingModel for AicTimingModel {
         }
 
         let batch_size = checked_u32(batch_size, "decode batch size")?;
-        let mean_context_length = checked_u32(mean_context_length, "mean context length")?;
-        let evidence =
-            self.predict_phase_evidence(batch_size, mean_context_length, 2, 0, "static_gen")?;
-        let latency_ms = evidence.latency_ms;
-        self.record_evidence(evidence, false)?;
+        // Both scheduler implementations include the current input token in
+        // their sequence length before sampling the next token. The op API's
+        // isl is past KV; osl=2 adds the current token exactly once.
+        let mean_past_kv = mean_context_length
+            .checked_sub(1)
+            .context("mean decode context must include the current input token")?;
+        let mean_past_kv = checked_u32(mean_past_kv, "mean past KV length")?;
+        let evidence = self.predict_phase_evidence(batch_size, mean_past_kv, 2, 0, "static_gen")?;
+        let latency_ms = evidence.as_phase().latency_ms;
+        self.record_evidence(&evidence, false)?;
         Ok(latency_ms)
     }
 
@@ -579,7 +762,19 @@ impl TimingModel for AicTimingModel {
         if self.use_fpm_decode_totals {
             return None;
         }
-        self.evidence.lock().ok().map(|evidence| evidence.clone())
+        self.evidence
+            .lock()
+            .ok()
+            .map(|evidence| evidence.snapshot())
+    }
+
+    fn reset_evidence(&self) -> Result<()> {
+        *self
+            .evidence
+            .lock()
+            .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))? =
+            TimingEvidenceAccumulator::default();
+        Ok(())
     }
 }
 
@@ -590,7 +785,7 @@ fn checked_u32(value: usize, name: &str) -> Result<u32> {
 fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig) -> Result<usize> {
     let (memory_fraction_kind, memory_fraction_value) = config.resolved_memory_fraction()?;
     Python::with_gil(|py| -> PyResult<usize> {
-        let memory = PyModule::import(py, "aiconfigurator_core.sdk.memory")?;
+        let memory = PyModule::import(py, "aisimulate_core.sdk.memory")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("backend_version", config.resolved_backend_version())?;
         kwargs.set_item("scheduler_block_size", role.rank.block_size)?;
@@ -608,6 +803,10 @@ fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig
         kwargs.set_item("fmha_quant_mode", config.fmha_dtype.as_deref())?;
         kwargs.set_item("kvcache_quant_mode", config.kv_cache_dtype.as_deref())?;
         kwargs.set_item("comm_quant_mode", config.comm_dtype.as_deref())?;
+        kwargs.set_item("moe_backend", config.moe_backend.as_deref())?;
+        kwargs.set_item("attention_backend", config.attention_backend.as_deref())?;
+        kwargs.set_item("enable_eplb", config.enable_eplb)?;
+        kwargs.set_item("wideep_num_slots", config.wideep_num_slots)?;
         kwargs.set_item(
             "cuda_graph_reserved_bytes",
             config.cuda_graph_reserved_bytes,
@@ -672,7 +871,7 @@ fn materialize_aic_capacity(
         timing_depth as usize == engine_nextn,
         "AIC speculative depth={timing_depth} does not match engine aic_nextn={engine_nextn}"
     );
-    if capacity_is_explicit {
+    if capacity_is_explicit || role.rank.state_cache.is_some() {
         return Ok(());
     }
     ensure!(
@@ -693,7 +892,7 @@ fn cap_role_capacity_to_fpm_decode_domain(
     let Some(decode_kv_ceiling) = decode_kv_ceiling else {
         return Ok(());
     };
-    if capacity_is_explicit {
+    if capacity_is_explicit || role.rank.state_cache.is_some() {
         return Ok(());
     }
     let covered_blocks = decode_kv_ceiling as usize / role.rank.block_size;
@@ -722,13 +921,19 @@ fn role_capacity_is_explicit(engine_value: &serde_json::Value, role: Option<&str
     role_rank
         .or_else(|| engine_value.get("rank"))
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|rank| rank.contains_key("num_gpu_blocks"))
+        .is_some_and(|rank| {
+            rank.contains_key("num_gpu_blocks")
+                || rank
+                    .get("state_cache")
+                    .is_some_and(|value| !value.is_null())
+        })
 }
 
 fn resolve_role_timing(
     role: &mut ReplayRoleConfig,
     capacity_is_explicit: bool,
     worker_type: ForwardPassWorkerType,
+    capture_performance_diagnostics: bool,
 ) -> Result<Option<Arc<dyn TimingModel>>> {
     let TimingModelConfig::External { provider, config } = role.rank.timing_model.clone() else {
         return Ok(None);
@@ -740,7 +945,10 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
-    let timing = AicTimingModel::build(&mut config, worker_type)?;
+    let mut timing = AicTimingModel::build(&mut config, worker_type)?;
+    if !capture_performance_diagnostics {
+        timing.diagnostic_model = None;
+    }
     materialize_aic_capacity(
         &config,
         role,
@@ -900,12 +1108,51 @@ fn resolve_kv_capacity_concurrency(
     Ok(Some(concurrency))
 }
 
+fn build_agentic_driver(
+    graph: ValidatedAgenticGraph,
+    traffic: &RuntimeTraffic,
+    engine_block_size: usize,
+    speedup: f64,
+) -> Result<WorkloadDriver> {
+    if let Some(options) = &traffic.agentic_snapshot {
+        let lanes = traffic
+            .agentic_lanes
+            .context("agentic_snapshot requires positive agentic_lanes")?;
+        // Sample recorded time before applying speedup to remaining timers.
+        let prepared = graph.prepare_snapshots(lanes, *options)?;
+        if traffic.agentic_warmup {
+            WorkloadDriver::new_agentic_warmup(prepared, engine_block_size, true, speedup)
+        } else {
+            WorkloadDriver::new_agentic_snapshots(prepared, engine_block_size, true, speedup)
+        }
+    } else {
+        WorkloadDriver::new_agentic_trace_with_options(
+            graph.normalize_starts().speed_up_timing(speedup)?,
+            engine_block_size,
+            true,
+            traffic.agentic_lanes,
+        )
+    }
+}
+
 fn build_runtime_input(
     traffic: RuntimeTraffic,
     engine_block_size: usize,
-    allow_agentic: bool,
 ) -> Result<BuiltRuntimeInput> {
     ensure!(engine_block_size > 0, "engine block size must be positive");
+    ensure!(
+        !traffic.agentic_warmup || traffic.agentic_snapshot.is_some(),
+        "agentic_warmup requires agentic_snapshot"
+    );
+    if traffic.agentic_snapshot.is_some() {
+        ensure!(
+            traffic.source_type == "trace"
+                && traffic.load_type.as_deref() == Some("trace_timestamps")
+                && traffic.agentic_lanes.is_some_and(|lanes| lanes > 0)
+                && traffic.replay_concurrency.is_none(),
+            "agentic_snapshot requires trace_timestamps agentic input with positive agentic_lanes"
+        );
+    }
     ensure!(
         traffic.source_type == "trace" || traffic.agentic_lanes.is_none(),
         "agentic_lanes requires agentic trace input"
@@ -939,7 +1186,6 @@ fn build_runtime_input(
                 traffic.load_type.as_deref() == Some("trace_timestamps"),
                 "agentic_mooncake requires trace_timestamps load"
             );
-            ensure!(allow_agentic, "agentic trace requires aggregated topology");
             ensure!(
                 traffic.max_sim_time_ms.is_none(),
                 "agentic trace does not support max virtual time"
@@ -952,15 +1198,13 @@ fn build_runtime_input(
                 traffic.replay_concurrency.is_none(),
                 "agentic_mooncake does not support concurrency load"
             );
-            let trace = load_agentic_mooncake(&paths[0], trace_block_size)?
-                .normalize_starts()
-                .speed_up_timing(speedup)?;
+            let trace = load_agentic_mooncake(&paths[0], trace_block_size)?;
             return Ok(BuiltRuntimeInput::without_weka_basis(
-                ReplayRuntimeInput::Workload(WorkloadDriver::new_agentic_trace_with_options(
+                ReplayRuntimeInput::Workload(build_agentic_driver(
                     trace,
+                    &traffic,
                     engine_block_size,
-                    true,
-                    traffic.agentic_lanes,
+                    speedup,
                 )?),
             ));
         }
@@ -969,10 +1213,6 @@ fn build_runtime_input(
             ensure!(
                 traffic.load_type.as_deref() == Some("trace_timestamps"),
                 "weka requires trace_timestamps load"
-            );
-            ensure!(
-                allow_agentic,
-                "Weka agentic trace requires aggregated topology"
             );
             ensure!(
                 traffic.max_sim_time_ms.is_none(),
@@ -991,16 +1231,13 @@ fn build_runtime_input(
                     nested_timestamp_basis: requested_basis,
                 },
             )?;
-            let trace = trace.normalize_starts().speed_up_timing(speedup)?;
             return Ok(BuiltRuntimeInput {
-                input: ReplayRuntimeInput::Workload(
-                    WorkloadDriver::new_agentic_trace_with_options(
-                        trace,
-                        engine_block_size,
-                        true,
-                        traffic.agentic_lanes,
-                    )?,
-                ),
+                input: ReplayRuntimeInput::Workload(build_agentic_driver(
+                    trace,
+                    &traffic,
+                    engine_block_size,
+                    speedup,
+                )?),
                 weka_nested_timestamp_basis: Some(resolved_basis),
             });
         }
@@ -1027,22 +1264,11 @@ fn build_runtime_input(
                         traffic.replay_concurrency.is_none(),
                         "agentic Dynamo trace does not support concurrency load"
                     );
-                    WorkloadDriver::new_agentic_trace_with_options(
-                        {
-                            ensure!(
-                                allow_agentic,
-                                "agentic Dynamo trace requires aggregated topology"
-                            );
-                            ensure!(
-                                traffic.max_sim_time_ms.is_none(),
-                                "agentic Dynamo trace does not support max virtual time"
-                            );
-                            trace.normalize_starts().speed_up_timing(speedup)?
-                        },
-                        engine_block_size,
-                        true,
-                        traffic.agentic_lanes,
-                    )?
+                    ensure!(
+                        traffic.max_sim_time_ms.is_none(),
+                        "agentic Dynamo trace does not support max virtual time"
+                    );
+                    build_agentic_driver(trace, &traffic, engine_block_size, speedup)?
                 }
             };
             return Ok(BuiltRuntimeInput::without_weka_basis(
@@ -1092,8 +1318,16 @@ fn build_runtime_input(
     } else {
         1
     };
+    let cached_prefix_tokens = traffic.cached_prefix_tokens.unwrap_or(0);
     let trace = Trace::synthetic(SyntheticTraceSpec {
-        block_size: engine_block_size,
+        // A one-token trace block preserves prefixes that are not aligned to
+        // the engine's scheduler block size. The driver still hashes them at
+        // `engine_block_size` when it constructs replay requests.
+        block_size: if cached_prefix_tokens == 0 {
+            engine_block_size
+        } else {
+            1
+        },
         num_sessions: sessions,
         turns_per_session: turns,
         input_tokens: LengthSpec {
@@ -1104,6 +1338,7 @@ fn build_runtime_input(
             mean: traffic.osl.context("synthetic traffic requires osl")?,
             stddev: 0.0,
         },
+        cached_prefix_tokens,
         shared_prefix_ratio: traffic.shared_prefix_ratio.unwrap_or(0.0),
         num_prefix_groups: traffic.num_prefix_groups.unwrap_or(0),
         first_turn_arrivals: synthetic_arrivals(&traffic)?,
@@ -1221,6 +1456,45 @@ fn phase_power_stats(combined: &TimingPhaseEvidence) -> Result<TracePowerStats> 
         .flatten()
         .filter(|power| power.is_finite() && *power > 0.0);
     TracePowerStats::new(power_w, coverage)
+}
+
+fn replay_performance_diagnostics(summary: Option<&TimingEvidenceSummary>) -> serde_json::Value {
+    let scope = "accumulated_active_forward_pass_per_gpu";
+    let Some(summary) = summary else {
+        return serde_json::json!({"status": "unavailable", "scope": scope, "latency_unit": "ms", "phases": [],
+            "unavailable_reason": "selected timing provider does not export operation diagnostics (whole-model FPM and latency-only providers are unsupported)"});
+    };
+    let phases = [("prefill", &summary.prefill), ("decode", &summary.decode)].into_iter().map(|(name, phase)| {
+        let mut operations = phase.operations.iter().map(|op| {
+            let sol = op.details.as_ref().and_then(|d| d.sol.as_ref());
+            serde_json::json!({"name": op.name, "latency_ms": op.latency_ms,
+                "source": op.source.as_str(),
+                "sol": sol,
+                "sol_unavailable_reason": if sol.is_some() { None } else {
+                    op.details.as_ref().and_then(|d| d.sol_unavailable_reason.as_deref()).or(Some("provider did not export SOL evidence"))
+                },
+                "latency_to_sol_ratio": sol.filter(|s| s.latency_ms > 0.0).map(|s| op.latency_ms / s.latency_ms).filter(|r| r.is_finite()),
+                "fallbacks": op.details.as_ref().map(|d| &d.fallbacks),
+            })
+        }).collect::<Vec<_>>();
+        operations.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+        let sol = phase.operations.iter().map(|op| op.details.as_ref()?.sol.as_ref()).collect::<Option<Vec<_>>>()
+            .filter(|ops| !ops.is_empty()).and_then(|ops| {
+                let latency_ms = ops.iter().map(|s| s.latency_ms).sum::<f64>();
+                let math_ms = ops.iter().map(|s| s.math_ms).sum::<f64>();
+                let memory_ms = ops.iter().map(|s| s.memory_ms).sum::<f64>();
+                [latency_ms, math_ms, memory_ms].iter().all(|v| v.is_finite()).then(||
+                    serde_json::json!({"latency_ms": latency_ms, "math_ms": math_ms, "memory_ms": memory_ms}))
+            });
+        serde_json::json!({"name": name, "latency_ms": phase.latency_ms, "sol": sol,
+            "sol_unavailable_reason": if sol.is_some() { None } else { Some("one or more operations lack SOL evidence, or this phase was not observed") },
+            "operations": operations})
+    }).collect::<Vec<_>>();
+    let observed = phases
+        .iter()
+        .any(|phase| !phase["operations"].as_array().unwrap().is_empty());
+    serde_json::json!({"status": if observed { "available" } else { "not_observed" },
+        "scope": scope, "latency_unit": "ms", "phases": phases})
 }
 
 fn replay_power_diagnostics(
@@ -1397,6 +1671,8 @@ fn scale_power_phase(
         operation.energy_wms = operation.energy_wms.map(|energy| energy * scale);
         operation.latency_ms *= scale;
         operation.covered_latency_ms *= scale;
+        // SOL compares the same scheduled work, before synthetic speedup; it
+        // remains an unscaled physical baseline.
     }
     Ok(phase)
 }
@@ -1433,10 +1709,14 @@ fn infer_aic_timing_topology(engine: &mut serde_json::Value) -> Result<()> {
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    let (mut spec, mut traffic) =
+    let (mut spec, mut traffic, capture_performance_diagnostics) =
         match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
-            ExecutionPayload::Configured { spec, traffic } => (spec, Some(*traffic)),
-            ExecutionPayload::Legacy(spec) => (spec, None),
+            ExecutionPayload::Configured {
+                spec,
+                traffic,
+                capture_performance_diagnostics,
+            } => (spec, traffic.map(|t| *t), capture_performance_diagnostics),
+            ExecutionPayload::Legacy(spec) => (spec, None, false),
         };
     let agentic_input = traffic.as_ref().and_then(|traffic| {
         traffic
@@ -1458,6 +1738,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         );
     }
     let serialized_engine = spec.engine.clone();
+    let record_per_request = spec.record_per_request;
     infer_aic_timing_topology(&mut spec.engine)?;
     let mut engine_config: ReplayEngineConfig = if spec.engine.is_null() {
         ReplayEngineConfig::default()
@@ -1481,6 +1762,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 &mut role,
                 capacity_is_explicit,
                 ForwardPassWorkerType::Aggregated,
+                capture_performance_diagnostics,
             )?;
             if let Some(timing) = timing.as_ref() {
                 power_sources.push(TimingPowerSource::new(Arc::clone(timing), &role.rank));
@@ -1507,7 +1789,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             spec.engine = serde_json::to_value(&engine_config)
                 .context("serializing materialized native engine descriptor")?;
             let built_input = traffic
-                .map(|traffic| build_runtime_input(traffic, engine_config.rank.block_size, true))
+                .map(|traffic| build_runtime_input(traffic, engine_config.rank.block_size))
                 .transpose()?;
             if let Some(built) = &built_input {
                 validate_public_agentic_engine(&built.input, &engine_config.rank)?;
@@ -1532,6 +1814,42 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 .decode
                 .clone()
                 .unwrap_or_else(|| aggregated_role(&engine_config));
+            // Determine the loaded kind before compiling either timing model:
+            // Dynamo inputs may contain ordinary or agentic requests. Retain
+            // the built input so this validation does not load the trace twice.
+            let trace_input = if traffic.as_ref().is_some_and(|traffic| {
+                traffic.source_type == "trace"
+                    && matches!(
+                        traffic.trace_format.as_deref(),
+                        Some("weka" | "agentic_mooncake" | "dynamo")
+                    )
+            }) {
+                let traffic = traffic.as_ref().expect("trace traffic was checked");
+                let built = build_runtime_input(traffic.clone(), prefill.rank.block_size)?;
+                if let ReplayRuntimeInput::Workload(driver) = &built.input
+                    && driver.is_agentic()
+                {
+                    let target = traffic.execution_model
+                        .as_deref()
+                        .map(str::trim)
+                        .context("agentic execution requires a configured target model")?;
+                    for (name, role) in [("prefill", &prefill), ("decode", &decode)] {
+                        if let TimingModelConfig::External { provider, config } =
+                            &role.rank.timing_model
+                            && provider == "aic"
+                        {
+                            let model = config.get("model").and_then(serde_json::Value::as_str);
+                            ensure!(
+                                model == Some(target),
+                                "{name} AIC timing model {model:?} must match agentic execution model {target:?}"
+                            );
+                        }
+                    }
+                }
+                Some(built)
+            } else {
+                None
+            };
             let prefill_capacity_is_explicit = prefill
                 .num_gpu_blocks_is_explicit
                 .unwrap_or_else(|| role_capacity_is_explicit(&serialized_engine, Some("prefill")));
@@ -1542,11 +1860,13 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 &mut prefill,
                 prefill_capacity_is_explicit,
                 ForwardPassWorkerType::Prefill,
+                capture_performance_diagnostics,
             )?;
             let decode_timing = resolve_role_timing(
                 &mut decode,
                 decode_capacity_is_explicit,
                 ForwardPassWorkerType::Decode,
+                capture_performance_diagnostics,
             )?;
             if let Some(timing) = prefill_timing.as_ref() {
                 power_sources.push(TimingPowerSource::new(Arc::clone(timing), &prefill.rank));
@@ -1571,8 +1891,9 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             }
             spec.engine = serde_json::to_value(&engine_config)
                 .context("serializing materialized native engine descriptor")?;
-            let built_input = traffic
-                .map(|traffic| {
+            let built_input = match trace_input {
+                Some(built) => Some(built),
+                None => traffic.map(|traffic| {
                     build_runtime_input(
                         traffic,
                         engine_config
@@ -1581,10 +1902,18 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                             .expect("prefill role was materialized")
                             .rank
                             .block_size,
-                        false,
                     )
                 })
-                .transpose()?;
+                .transpose()?,
+            };
+            if let Some(built) = &built_input {
+                for role in [&engine_config.prefill, &engine_config.decode] {
+                    validate_public_agentic_engine(
+                        &built.input,
+                        &role.as_ref().expect("P/D role was materialized").rank,
+                    )?;
+                }
+            }
             let resolved_basis = built_input
                 .as_ref()
                 .and_then(|built| built.weka_nested_timestamp_basis);
@@ -1625,6 +1954,10 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     )?));
     let mut report_json =
         serde_json::to_value(&report).context("serializing AISimulate replay report summary")?;
+    if capture_performance_diagnostics {
+        report_json["performance_diagnostics"] =
+            replay_performance_diagnostics(timing_evidence.as_ref());
+    }
     if report.agentic_graph.is_some()
         && let Some((input_format, agentic_lanes, execution_model)) = agentic_input
     {
@@ -1670,7 +2003,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             }),
         );
     }
-    if !report.per_request.is_empty() {
+    if record_per_request || !report.per_request.is_empty() {
         let object = report_json
             .as_object_mut()
             .context("AISimulate replay report did not serialize as an object")?;
@@ -1795,6 +2128,79 @@ mod tests {
     }
 
     #[test]
+    fn warmup_requires_a_boolean_and_seeded_snapshot_at_the_native_boundary() {
+        let base = serde_json::json!({
+            "source_type": "trace", "load_type": "trace_timestamps",
+            "trace_path": "unused", "trace_format": "weka", "agentic_lanes": 1,
+        });
+        assert!(
+            !serde_json::from_value::<RuntimeTraffic>(base.clone())
+                .unwrap()
+                .agentic_warmup
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!("true"),
+            serde_json::json!({}),
+        ] {
+            let mut traffic = base.clone();
+            traffic["agentic_warmup"] = invalid;
+            assert!(serde_json::from_value::<RuntimeTraffic>(traffic).is_err());
+        }
+        let mut traffic = base;
+        traffic["agentic_warmup"] = serde_json::json!(true);
+        let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
+        assert!(
+            build_runtime_input(traffic, 64)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("agentic_warmup requires agentic_snapshot")
+        );
+    }
+
+    #[test]
+    fn snapshot_options_are_strict_at_the_native_json_boundary() {
+        let base = serde_json::json!({
+            "source_type": "trace", "load_type": "trace_timestamps",
+            "trace_path": "unused", "trace_format": "weka", "agentic_lanes": 1,
+        });
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"seed": true}),
+            serde_json::json!({"seed": -1}),
+            serde_json::json!({"seed": 1.0}),
+            serde_json::json!({"seed": "42"}),
+            serde_json::json!({"seed": 42, "extra": 0}),
+        ] {
+            let mut traffic = base.clone();
+            traffic["agentic_snapshot"] = invalid;
+            assert!(serde_json::from_value::<RuntimeTraffic>(traffic).is_err());
+        }
+        for (field, invalid) in [
+            ("source_type", serde_json::json!("synthetic")),
+            ("load_type", serde_json::json!("concurrency")),
+            ("agentic_lanes", serde_json::json!(0)),
+            ("agentic_lanes", serde_json::Value::Null),
+            ("replay_concurrency", serde_json::json!(1)),
+        ] {
+            let mut traffic = base.clone();
+            traffic["agentic_snapshot"] = serde_json::json!({"seed": u64::MAX});
+            traffic[field] = invalid;
+            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
+            assert!(
+                build_runtime_input(traffic, 64)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("agentic_snapshot requires")
+            );
+        }
+    }
+
+    #[test]
     fn public_agentic_json_rejects_unqualified_modes_without_restricting_standard_dynamo() {
         let directory = tempfile::tempdir().unwrap();
         let dynamo = serde_json::json!({
@@ -1888,10 +2294,128 @@ mod tests {
                 if agentic {
                     let error = format!("{:#}", result.unwrap_err());
                     assert!(error.contains(message), "{format}: {error}");
+                    // Public P/D must validate both roles, including a decode
+                    // role whose invalid configuration is absent from prefill.
+                    for invalid_role in ["prefill", "decode"] {
+                        let mut disagg = payload.clone();
+                        disagg["spec"]["topology"] = serde_json::json!({
+                            "kind": "disaggregated",
+                            "prefill": {"initial_workers": 1},
+                            "decode": {"initial_workers": 1}
+                        });
+                        let valid = serde_json::json!({
+                            "backend": "vllm", "block_size": 4, "num_gpu_blocks": 16,
+                            "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+                        });
+                        disagg["spec"]["engine"] = serde_json::json!({
+                            "prefill": {"rank": valid}, "decode": {"rank": valid}
+                        });
+                        disagg["spec"]["engine"][invalid_role]["rank"] = rank.clone();
+                        let error = format!(
+                            "{:#}",
+                            execute_json(&disagg.to_string(), false).unwrap_err()
+                        );
+                        assert!(error.contains(message), "{format}/{invalid_role}: {error}");
+                    }
                 } else {
                     let report: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
                     assert_eq!(report["completed_requests"], 1);
                     assert!(report.get("agentic_qualification").is_none());
+                }
+            }
+            // Exercise all three importers through the actual native P/D
+            // entrypoint. Standard Dynamo remains a non-agentic workload.
+            for backend in ["vllm", "sglang"] {
+                let rank = serde_json::json!({
+                    "backend": backend, "block_size": 4, "num_gpu_blocks": 16,
+                    "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+                });
+                let mut payload = serde_json::json!({
+                    "spec": {
+                        "version": 1,
+                        "topology": {
+                            "kind": "disaggregated",
+                            "prefill": {"initial_workers": 1},
+                            "decode": {"initial_workers": 1}
+                        },
+                        "engine": {"prefill": {"rank": rank}, "decode": {"rank": rank}},
+                        "requests": []
+                    },
+                    "traffic": {
+                        "source_type": "trace", "load_type": "trace_timestamps",
+                        "trace_format": format, "trace_path": path,
+                        "trace_block_size": 4, "execution_model": "model"
+                    }
+                });
+                if agentic {
+                    for invalid_roles in
+                        [vec!["prefill"], vec!["decode"], vec!["prefill", "decode"]]
+                    {
+                        let mut invalid = payload.clone();
+                        for role in ["prefill", "decode"] {
+                            invalid["spec"]["engine"][role]["rank"]["timing_model"] = serde_json::json!({
+                                "type": "external", "provider": "aic",
+                                "config": {"model": if invalid_roles.contains(&role) { "different-model" } else { "model" }, "backend": backend, "system": "test-system", "tp": 1}
+                            });
+                        }
+                        let error = format!(
+                            "{:#}",
+                            execute_json(&invalid.to_string(), false).unwrap_err()
+                        );
+                        assert!(
+                            error.contains("must match agentic execution model"),
+                            "{format}/{backend}/{invalid_roles:?}: {error}"
+                        );
+                    }
+                } else {
+                    // Standard Dynamo still reaches ordinary capacity/provider
+                    // validation instead of acquiring an agentic model gate.
+                    let mut ordinary = payload.clone();
+                    ordinary["traffic"]["load_type"] = serde_json::json!("kv_capacity_fraction");
+                    ordinary["traffic"]["kv_load_ratio"] = serde_json::json!(0);
+                    let error = format!(
+                        "{:#}",
+                        execute_json(&ordinary.to_string(), false).unwrap_err()
+                    );
+                    assert!(error.contains("KV load ratio must be positive"), "{error}");
+                    ordinary = payload.clone();
+                    ordinary["spec"]["engine"]["decode"]["rank"]["timing_model"] = serde_json::json!({
+                        "type": "external", "provider": "aic", "config": {"model": "different-model"}
+                    });
+                    let error = format!(
+                        "{:#}",
+                        execute_json(&ordinary.to_string(), false).unwrap_err()
+                    );
+                    assert!(
+                        error.contains("invalid AIC timing provider configuration"),
+                        "{error}"
+                    );
+                }
+                for warmup in [false, true] {
+                    if warmup {
+                        if !agentic {
+                            continue;
+                        }
+                        payload["traffic"]["agentic_lanes"] = serde_json::json!(1);
+                        payload["traffic"]["agentic_snapshot"] = serde_json::json!({"seed": 0});
+                        payload["traffic"]["agentic_warmup"] = serde_json::json!(true);
+                    }
+                    let report: serde_json::Value = serde_json::from_str(
+                        &execute_json(&payload.to_string(), false).unwrap_or_else(|error| {
+                            panic!("{format}/{backend}/{warmup}: {error:#}")
+                        }),
+                    )
+                    .unwrap();
+                    assert_eq!(report["completed_requests"], 1);
+                    assert_eq!(report.get("agentic_qualification").is_some(), agentic);
+                    if warmup {
+                        assert_eq!(report["agentic_phases"]["lanes"][0]["warmup_completed"], 10);
+                        assert!(
+                            report["agentic_phases"]["profile_start_ms"]
+                                .as_f64()
+                                .is_some()
+                        );
+                    }
                 }
             }
         }
@@ -1994,13 +2518,225 @@ mod tests {
         }
     }
 
-    fn timing_model(engine: Py<PyAny>, use_fpm_decode_totals: bool) -> AicTimingModel {
+    fn python_timing_model(engine: Py<PyAny>, use_fpm_decode_totals: bool) -> AicTimingModel {
         AicTimingModel {
             engine,
+            diagnostic_model: None,
+            decoder_replay: false,
+            phase_provider: AicPhaseProvider::Python,
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling: None,
-            evidence: Mutex::new(TimingEvidenceSummary::default()),
+            evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             phase_cache: quick_cache::sync::Cache::new(128),
+        }
+    }
+
+    #[test]
+    fn native_phase_evidence_matches_python_bridge() {
+        use crate::operators::{FpmForwardOp, FpmPhase, op::Op, util_empirical::ProvenanceTier};
+        use crate::perfmodel::engine::spec::EngineSpec;
+
+        let required = std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_some();
+        if let Err(error) =
+            Python::with_gil(|py| py.import("aisimulate_core.sdk.engine").map(|_| ()))
+        {
+            assert!(
+                !required,
+                "native_phase_evidence_matches_python_bridge: \
+                 AIC_REQUIRE_EMBEDDED_ROUND_TRIP is set but \
+                 `aisimulate_core.sdk.engine` is not importable: {error}. \
+                 Install the Python SDK and set PYTHONPATH for the embedded interpreter."
+            );
+            eprintln!(
+                "native_phase_evidence_matches_python_bridge: SKIP — \
+                 `aisimulate_core.sdk.engine` is not importable: {error}. \
+                 Set AIC_REQUIRE_EMBEDDED_ROUND_TRIP=1 + PYTHONPATH to enforce."
+            );
+            return;
+        }
+
+        let mut config = aic_config();
+        config.model = "Qwen/Qwen3.8-2.4T-A95B-FP8".into();
+        config.system = "gb300".into();
+        config.backend = "sglang".into();
+        config.backend_version = Some("0.5.17".into());
+        config.tp = 16;
+        config.moe_tp_size = Some(4);
+        config.moe_ep_size = Some(4);
+        config.systems_paths = vec![
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../python/aisimulate/src/aisimulate_core/systems"),
+        ];
+        let mut native =
+            AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated).unwrap();
+        native.diagnostic_model = None;
+        let raw = match &native.phase_provider {
+            AicPhaseProvider::Native(engine) => Arc::clone(engine),
+            AicPhaseProvider::Python | AicPhaseProvider::NativeEntries(_) => unreachable!(),
+        };
+        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        let check =
+            |native: &AicTimingModel, bridge: &AicTimingModel, args| {
+                let (batch, isl, osl, prefix, mode) = args;
+                raw.database().note_provenance(ProvenanceTier::Empirical);
+                let actual = native.predict_phase_evidence(batch, isl, osl, prefix, mode);
+                let provenance = raw.last_provenance();
+                raw.database().note_provenance(ProvenanceTier::Empirical);
+                let expected = bridge.predict_phase_evidence(batch, isl, osl, prefix, mode);
+                assert_eq!(provenance, raw.last_provenance());
+                match (actual, expected) {
+                    (Ok(actual), Ok(expected)) => {
+                        let a = actual.as_phase();
+                        let b = expected.as_phase();
+                        assert_eq!(a, b);
+                        let bits =
+                            |phase: &TimingPhaseEvidence| {
+                                std::iter::once((
+                                    phase.latency_ms,
+                                    phase.energy_wms,
+                                    phase.covered_latency_ms,
+                                ))
+                                .chain(phase.operations.iter().map(|op| {
+                                    (op.latency_ms, op.energy_wms, op.covered_latency_ms)
+                                }))
+                                .map(|(latency, energy, covered)| {
+                                    (
+                                        latency.to_bits(),
+                                        energy.map(f64::to_bits),
+                                        covered.to_bits(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                            };
+                        assert_eq!(bits(a), bits(b));
+                    }
+                    (Err(actual), Err(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string())
+                    }
+                    mismatch => panic!("native/bridge mismatch: {mismatch:?}"),
+                }
+            };
+        for args in [
+            (0, 128, 1, 0, "static_ctx"),
+            (4, 1024, 1, 128, "static_ctx"),
+            (4, 128, 1, 128, "static_ctx"),
+            (1, 128, 2, 0, "static_gen"),
+            (32, 4096, 2, 0, "static_gen"),
+            (7, 1777, 3, 0, "invalid-mode"),
+        ] {
+            check(&native, &bridge, args);
+            check(&native, &bridge, args); // Cache hits must retain the same behavior.
+        }
+
+        // Exercise the shipping adapter through its public timing entrypoints,
+        // including accumulation on cache hits and changes in query geometry.
+        for (prefill, batch, length, prefix) in [
+            (true, 4, 1024, 128),
+            (true, 4, 1024, 128),
+            (true, 4, 1536, 256),
+            (false, 1, 129, 0),
+            (false, 1, 129, 0),
+            (false, 1, 257, 0),
+        ] {
+            let key = if prefill {
+                (batch as u32, length as u32, 1, prefix as u32, true)
+            } else {
+                (batch as u32, length as u32 - 1, 2, 0, false)
+            };
+            let cached = native.phase_cache.get(&key);
+            let predict = |timing: &AicTimingModel| {
+                if prefill {
+                    timing.predict_prefill_ms(batch, length, prefix)
+                } else {
+                    timing.predict_decode_ms(batch, batch * length, length, 16384)
+                }
+                .unwrap()
+            };
+            assert_eq!(predict(&native).to_bits(), predict(&bridge).to_bits());
+            if let Some(cached) = cached {
+                assert!(Arc::ptr_eq(&cached, &native.phase_cache.get(&key).unwrap()));
+            }
+            let actual = native.evidence_summary().unwrap();
+            let expected = bridge.evidence_summary().unwrap();
+            assert_eq!(actual, expected);
+            for (a, b) in [
+                (&actual.prefill, &expected.prefill),
+                (&actual.decode, &expected.decode),
+            ] {
+                let bits = |phase: &TimingPhaseEvidence| {
+                    std::iter::once((phase.latency_ms, phase.energy_wms, phase.covered_latency_ms))
+                        .chain(
+                            phase
+                                .operations
+                                .iter()
+                                .map(|op| (op.latency_ms, op.energy_wms, op.covered_latency_ms)),
+                        )
+                        .map(|(latency, energy, covered)| {
+                            (
+                                latency.to_bits(),
+                                energy.map(f64::to_bits),
+                                covered.to_bits(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(a), bits(b));
+            }
+        }
+
+        // Exercise a real missing-data error through both callers. Only the
+        // test engine is synthetic; the production constructor is unchanged.
+        let missing_op = |phase| {
+            Op::FpmForward(FpmForwardOp {
+                name: "missing".into(),
+                phase,
+                model_path: "missing-test-model".into(),
+                match_identity: vec!["missing".into(); 11],
+                weight_bytes: 0.0,
+                verify_width: 1,
+                original_fmha_quant_mode: None,
+                sol_ops: Vec::new(),
+            })
+        };
+        let identity = serde_json::from_value(serde_json::json!({
+            "schema_version": crate::ENGINE_CONFIG_SCHEMA_VERSION,
+            "model_name": "missing-test-model", "system_name": "gb300", "backend": "sglang",
+            "tp_size": 16, "pp_size": 1
+        }))
+        .unwrap();
+        let missing = Arc::new(
+            PerfEngine::build(
+                EngineSpec::new(
+                    identity,
+                    vec![missing_op(FpmPhase::Prefill)],
+                    vec![missing_op(FpmPhase::Decode)],
+                ),
+                Arc::clone(raw.database()),
+            )
+            .unwrap(),
+        );
+        let mut native = Python::with_gil(|py| {
+            python_timing_model(
+                Py::new(
+                    py,
+                    crate::AicEngine::from_shared_engine(Arc::clone(&missing)),
+                )
+                .unwrap()
+                .into_any(),
+                false,
+            )
+        });
+        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        native.phase_provider = AicPhaseProvider::Native(missing);
+        for mode in ["static_ctx", "static_gen"] {
+            let error = native
+                .predict_phase_evidence(1, 128, 2, 0, mode)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("PerfDataNotAvailableError"),
+                "{error}"
+            );
+            check(&native, &bridge, (1, 128, 2, 0, mode));
         }
     }
 
@@ -2040,6 +2776,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_timing_config_preserves_moe_kernel_source() {
+        let mut config = aic_config();
+        config.moe_kernel_source = Some("sglang_flashinfer_trtllm_moe".into());
+
+        assert_eq!(
+            config
+                .estimator_request(ForwardPassWorkerType::Aggregated)
+                .unwrap()
+                .moe_kernel_source
+                .as_deref(),
+            Some("sglang_flashinfer_trtllm_moe")
+        );
+    }
+
     fn aic_config() -> AicTimingConfig {
         AicTimingConfig {
             model: "test-model".into(),
@@ -2055,6 +2806,7 @@ mod tests {
             gemm_dtype: None,
             moe_dtype: None,
             fmha_dtype: None,
+            fpm_fmha_dtype: None,
             kv_cache_dtype: None,
             comm_dtype: None,
             nextn: 0,
@@ -2072,10 +2824,16 @@ mod tests {
             transfer_policy: None,
             systems_paths: Vec::new(),
             attention_backend: None,
+            moe_backend: None,
+            enable_eplb: false,
+            wideep_num_slots: None,
+            moe_kernel_source: None,
             enable_shared_layer: None,
             strict_provenance: false,
             systems_path: None,
             forward_model: None,
+            fpm_parquet_path: None,
+            decoder_replay: false,
         }
     }
 
@@ -2210,6 +2968,30 @@ mod tests {
     }
 
     #[test]
+    fn manual_state_capacity_bypasses_native_estimation_and_fpm_capping() {
+        let rank_json = serde_json::json!({"num_gpu_blocks":8,"block_size":64,"kv_cache_bytes_per_token":16,
+            "state_cache": {"bytes_per_request":1500}});
+        assert!(role_capacity_is_explicit(
+            &serde_json::json!({"rank": rank_json}),
+            None
+        ));
+        assert!(!role_capacity_is_explicit(
+            &serde_json::json!({"rank": {"state_cache": null}}),
+            None
+        ));
+        let mut role = aggregated_role(&ReplayEngineConfig::default());
+        role.rank = serde_json::from_value(rank_json).unwrap();
+        // Even a stale/false outer hint must not override explicit manual geometry.
+        materialize_aic_capacity(&aic_config(), &mut role, false, |_, _| {
+            panic!("manual state capacity must never invoke the estimator")
+        })
+        .unwrap();
+        cap_role_capacity_to_fpm_decode_domain(&mut role, Some(64), false).unwrap();
+        assert_eq!(role.rank.num_gpu_blocks, 8);
+        assert_eq!(role.rank.block_size, 64);
+    }
+
+    #[test]
     fn invalid_memory_fraction_is_rejected() {
         let mut config = aic_config();
         config.gpu_memory_utilization = Some(1.1);
@@ -2224,15 +3006,15 @@ mod tests {
 
     #[test]
     fn per_op_power_summary_matches_aic_coverage_semantics() {
-        let summary = phase_evidence_from_python(vec![
+        let summary = phase_evidence_from_entries(vec![
             ("covered".into(), 100.0, 50_000.0, "silicon".into()),
             ("missing".into(), 25.0, 0.0, "empirical".into()),
             ("no-op".into(), 0.0, 0.0, "silicon".into()),
         ])
         .unwrap();
-        assert_eq!(summary.energy_wms, Some(50_000.0));
-        assert_eq!(summary.latency_ms, 125.0);
-        assert_eq!(summary.covered_latency_ms, 100.0);
+        assert_eq!(summary.as_phase().energy_wms, Some(50_000.0));
+        assert_eq!(summary.as_phase().latency_ms, 125.0);
+        assert_eq!(summary.as_phase().covered_latency_ms, 100.0);
     }
 
     #[test]
@@ -2496,6 +3278,7 @@ mod tests {
                 latency_ms: 2.0,
                 covered_latency_ms: 1.0,
                 source: TimingEvidenceSource::Mixed,
+                details: None,
             },
             Some(400.0),
         );
@@ -2516,6 +3299,7 @@ mod tests {
                 latency_ms: 0.0,
                 covered_latency_ms: 0.0,
                 source: TimingEvidenceSource::Silicon,
+                details: None,
             },
             Some(400.0),
         );
@@ -2523,6 +3307,74 @@ mod tests {
         assert_eq!(zero_latency["status"], "available");
         assert_eq!(zero_latency["power_coverage"], 0.0);
         assert!(zero_latency.get("uncovered_reason").is_none());
+    }
+
+    #[test]
+    fn performance_evidence_accumulates_sol_and_deduplicates_executed_fallbacks() {
+        use crate::perfmodel::engine::diagnostics::{
+            ExecutedFallback, OperationDetails, SolDiagnostics,
+        };
+        let mut op =
+            TimingOperationEvidence::new("dispatch", 10.0, None, TimingEvidenceSource::Estimated)
+                .unwrap();
+        op.details = Some(OperationDetails {
+            sol: Some(SolDiagnostics {
+                latency_ms: 2.0,
+                math_ms: 0.0,
+                memory_ms: 2.0,
+            }),
+            sol_unavailable_reason: None,
+            fallbacks: vec![ExecutedFallback {
+                inference_phase: "context".into(),
+                comm_backend: "deepep_ll".into(),
+                requested_ep_size: 32,
+                requested_node_num: 8,
+                measurement_ep_size: 4,
+                measurement_node_num: 1,
+            }],
+        });
+        let phase = TimingPhaseEvidence::try_from_operations(vec![op.clone()]).unwrap();
+        let mut total = phase.clone();
+        total.try_accumulate(phase).unwrap();
+        // Two scheduled 10ms steps, divided by synthetic speedup 2. SOL is
+        // the physical baseline: two 2ms steps, without synthetic speedup.
+        let summary = TimingEvidenceSummary {
+            prefill: scale_power_phase(total, 2.0).unwrap(),
+            decode: Default::default(),
+        };
+        let report = replay_performance_diagnostics(Some(&summary));
+        assert_eq!(report["phases"][0]["latency_ms"], 10.0);
+        assert_eq!(report["phases"][0]["sol"]["latency_ms"], 4.0);
+        assert_eq!(
+            report["phases"][0]["operations"][0]["latency_to_sol_ratio"],
+            2.5
+        );
+        assert_eq!(
+            report["phases"][0]["operations"][0]["fallbacks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A missing comparison in any scheduled step invalidates the total,
+        // but does not hide its source or executed fallback records.
+        op.details.as_mut().unwrap().sol = None;
+        op.details.as_mut().unwrap().sol_unavailable_reason = Some("unsupported shape".into());
+        let mut mixed = summary.prefill;
+        mixed
+            .try_accumulate(TimingPhaseEvidence::try_from_operations(vec![op]).unwrap())
+            .unwrap();
+        let report = replay_performance_diagnostics(Some(&TimingEvidenceSummary {
+            prefill: mixed,
+            decode: Default::default(),
+        }));
+        assert!(report["phases"][0]["sol"].is_null());
+        assert_eq!(
+            report["phases"][0]["operations"][0]["sol_unavailable_reason"],
+            "unsupported shape"
+        );
+        assert_eq!(report["phases"][0]["operations"][0]["source"], "estimated");
+        assert!(report["phases"][0]["operations"][0]["latency_to_sol_ratio"].is_null());
     }
 
     #[test]
@@ -2546,23 +3398,73 @@ mod tests {
     }
 
     #[test]
+    fn aic_timing_rejects_invalid_fpm_paths_before_entering_python() {
+        for (path, model) in [("", "fpm"), ("/missing/fpm.parquet", "op_level")] {
+            let mut config = aic_config();
+            config.fpm_parquet_path = Some(path.into());
+            config.forward_model = Some(model.into());
+            let err = AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated)
+                .err()
+                .expect("invalid path");
+            assert!(err.to_string().contains("fpm_parquet_path"), "{err}");
+        }
+    }
+
+    #[test]
     fn aic_timing_config_accepts_fpm_forward_model() {
         let config = serde_json::from_value::<AicTimingConfig>(serde_json::json!({
             "model": "test-model",
             "backend": "vllm",
             "system": "test-system",
             "tp": 1,
-            "forward_model": "fpm"
+            "forward_model": "fpm",
+            "fpm_parquet_path": "/artifacts/reviewed-fpm.parquet"
         }))
         .unwrap();
         assert_eq!(config.forward_model.as_deref(), Some("fpm"));
+        assert_eq!(
+            config.fpm_parquet_path.as_deref(),
+            Some("/artifacts/reviewed-fpm.parquet")
+        );
+    }
+
+    #[test]
+    fn timing_policy_reaches_canonical_request() {
+        for replay in [false, true] {
+            let config = serde_json::from_value::<AicTimingConfig>(serde_json::json!({
+                "model": "test-model", "backend": "sglang", "system": "test-system", "tp": 1,
+                "decoder_replay": replay, "database_mode": "SILICON",
+                "forward_model": "fpm", "fpm_fmha_dtype": "fp8",
+                "enable_shared_layer": false, "strict_provenance": true
+            }))
+            .unwrap();
+            let request = config
+                .estimator_request(ForwardPassWorkerType::Aggregated)
+                .unwrap();
+            assert_eq!(request.decoder_replay, replay);
+            assert_eq!(request.fpm_fmha_quant_mode.as_deref(), Some("fp8"));
+            assert_eq!(request.database_mode, crate::DatabaseMode::Silicon);
+            assert_eq!(request.enable_shared_layer, Some(false));
+            assert!(request.strict_provenance);
+            let round_trip: ForwardPassPerfModelConfig =
+                serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+            assert_eq!(round_trip, request);
+        }
+        let defaults = serde_json::from_value::<AicTimingConfig>(serde_json::json!({
+            "model": "test-model", "backend": "sglang", "system": "test-system", "tp": 1
+        }))
+        .unwrap();
+        assert!(!defaults.decoder_replay);
+        assert_eq!(defaults.database_mode, crate::DatabaseMode::default());
+        assert!(defaults.enable_shared_layer.is_none());
+        assert!(!defaults.strict_provenance);
     }
 
     #[test]
     fn fpm_decode_timing_queries_exact_past_kv_total() {
         pyo3::prepare_freethreaded_python();
         let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
-        let timing = timing_model(engine, true);
+        let timing = python_timing_model(engine, true);
 
         let latency = timing
             .predict_decode_ms(35, 546_081, 15_602, 546_048)
@@ -2576,13 +3478,55 @@ mod tests {
     fn fpm_decode_timing_caps_logical_past_kv_at_physical_capacity() {
         pyo3::prepare_freethreaded_python();
         let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
-        let timing = timing_model(engine, true);
+        let timing = python_timing_model(engine, true);
 
         let latency = timing
             .predict_decode_ms(35, 546_116, 15_603, 546_048)
             .unwrap();
 
         assert_eq!(latency, 546_048.0);
+    }
+
+    #[test]
+    fn op_level_decode_timing_converts_inclusive_mean_to_past_kv() {
+        pyo3::prepare_freethreaded_python();
+        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let timing = python_timing_model(engine, false);
+
+        let latency = timing
+            .predict_decode_ms(35, 546_081, 15_602, 546_048)
+            .unwrap();
+
+        assert_eq!(latency, 546_070.0);
+        for inclusive_length in [1, 128, 129, 2049] {
+            assert_eq!(
+                timing
+                    .predict_decode_ms(2, 2 * inclusive_length, inclusive_length, 8192)
+                    .unwrap(),
+                (2 * inclusive_length) as f64,
+            );
+        }
+        assert!(timing.predict_decode_ms(1, 0, 0, 8192).is_err());
+    }
+
+    #[test]
+    fn bounded_replay_rejects_heterogeneous_actual_prefill_geometry() {
+        pyo3::prepare_freethreaded_python();
+        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let mut timing = python_timing_model(engine, false);
+        timing.decoder_replay = true;
+        for geometry in [vec![], vec![(3, 1536)], vec![(129, 128), (129, 128)]] {
+            timing.validate_prefill_batch(&geometry).unwrap();
+        }
+        for geometry in [vec![(127, 128), (129, 128)], vec![(3, 128), (3, 1536)]] {
+            assert!(timing.prefill_batch_validation_can_fail());
+            let error = timing.validate_prefill_batch(&geometry).unwrap_err();
+            assert!(error.to_string().contains("heterogeneous prefill"));
+            timing.decoder_replay = false;
+            assert!(!timing.prefill_batch_validation_can_fail());
+            timing.validate_prefill_batch(&geometry).unwrap();
+            timing.decoder_replay = true;
+        }
     }
 
     #[test]
@@ -2593,7 +3537,7 @@ mod tests {
                 .unwrap()
                 .into_any()
         });
-        let timing = timing_model(engine, false);
+        let timing = python_timing_model(engine, false);
 
         assert_eq!(timing.predict_prefill_ms(2, 128, 0).unwrap(), 10.0);
         assert_eq!(timing.predict_decode_ms(2, 258, 128, 1024).unwrap(), 4.0);
@@ -2618,7 +3562,7 @@ mod tests {
     fn repeated_shapes_reuse_provider_evidence_and_accumulate_every_step() {
         pyo3::prepare_freethreaded_python();
         let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = timing_model(
+        let timing = python_timing_model(
             Python::with_gil(|py| engine.clone_ref(py).into_any()),
             false,
         );
@@ -2638,6 +3582,10 @@ mod tests {
             timing.evidence_summary().unwrap().decode.energy_wms,
             Some(1_600_000.0)
         );
+        let cached = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
+        let again = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
+        assert!(Arc::ptr_eq(&cached, &again));
+        assert_eq!(cached.as_phase().energy_wms, Some(1_600.0));
         // Distinct coordinates must never reuse the preceding shape's result.
         timing.predict_decode_ms(2, 260, 129, 1024).unwrap();
         Python::with_gil(|py| {
@@ -2652,32 +3600,290 @@ mod tests {
     }
 
     #[test]
-    fn empty_provider_evidence_rejects_nonzero_work() {
+    fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
         pyo3::prepare_freethreaded_python();
+        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing = python_timing_model(
+            Python::with_gil(|py| engine.clone_ref(py).into_any()),
+            false,
+        );
+        timing.predict_prefill_ms(2, 128, 0).unwrap();
+        timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
+        let before = timing.evidence_summary().unwrap();
+        assert_eq!(before.prefill.source, Some(TimingEvidenceSource::Mixed));
+        assert!(replay_power_stats(&before).unwrap().coverage() < 1.0);
+
+        timing.reset_evidence().unwrap();
+        assert_eq!(
+            timing.evidence_summary(),
+            Some(TimingEvidenceSummary::default())
+        );
+        timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
+        let after = timing.evidence_summary().unwrap();
+        assert_eq!(after.prefill, TimingPhaseEvidence::default());
+        assert_eq!(after.decode, before.decode);
+        assert_eq!(replay_power_stats(&after).unwrap().coverage(), 1.0);
+        assert_eq!(replay_power_stats(&after).unwrap().power_w(), Some(400.0));
+        Python::with_gil(|py| {
+            assert_eq!(
+                engine
+                    .borrow(py)
+                    .calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+        });
+        timing.reset_evidence().unwrap();
+        assert_eq!(
+            timing.evidence_summary(),
+            Some(TimingEvidenceSummary::default())
+        );
+    }
+
+    #[test]
+    fn empty_native_evidence_and_diagnostics_reject_nonzero_work() {
+        use crate::perfmodel::engine::{Engine, spec::EngineSpec};
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        let db = crate::perf_database::PerfDatabase::load(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../python/aisimulate/src/aisimulate_core/systems"),
+            "h200_sxm",
+            "sglang",
+            "0.5.6.post2",
+        )
+        .unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "schema_version": crate::ENGINE_CONFIG_SCHEMA_VERSION,
+            "model_name": "empty-fixture", "system_name": "h200_sxm",
+            "backend": "sglang", "backend_version": "0.5.6.post2",
+            "tp_size": 1, "pp_size": 1
+        }))
+        .unwrap();
+        let native =
+            Arc::new(Engine::build(EngineSpec::new(config, vec![], vec![]), Arc::new(db)).unwrap());
         let engine = Python::with_gil(|py| {
             Py::new(py, PerOpEvidenceProbe::default())
                 .unwrap()
                 .into_any()
         });
-        let timing = timing_model(engine, false);
+        let mut timing = python_timing_model(engine, false);
+        timing.phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
+        timing.diagnostic_model = Some(ForwardPassPerfModel::from_engine(
+            native,
+            ForwardPassPerfOptions::default(),
+        ));
+        for kind in ["diagnostics", "evidence"] {
+            for mode in ["static_ctx", "static_gen"] {
+                let error = timing
+                    .predict_phase_evidence(1, 128, 2, 0, mode)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("AIC {mode} returned empty operation {kind}"))
+                );
+                assert_eq!(
+                    timing
+                        .predict_phase_evidence(0, 128, 2, 0, mode)
+                        .unwrap()
+                        .as_phase()
+                        .latency_ms,
+                    0.0
+                );
+            }
+            assert_eq!(
+                timing
+                    .predict_phase_evidence(1, 128, 2, 128, "static_ctx")
+                    .unwrap()
+                    .as_phase()
+                    .latency_ms,
+                0.0
+            );
+            assert_eq!(
+                timing.evidence_summary(),
+                Some(TimingEvidenceSummary::default())
+            );
+            timing.diagnostic_model = None;
+        }
+    }
+
+    #[test]
+    fn empty_provider_evidence_rejects_nonzero_work() {
+        pyo3::prepare_freethreaded_python();
+        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing = python_timing_model(
+            Python::with_gil(|py| engine.clone_ref(py).into_any()),
+            false,
+        );
         assert!(timing.predict_prefill_ms(99, 128, 0).is_err());
         assert!(timing.predict_decode_ms(99, 12800, 128, 16384).is_err());
-        assert_eq!(timing.predict_prefill_ms(0, 128, 0).unwrap(), 0.0);
-        assert_eq!(timing.predict_decode_ms(0, 0, 128, 16384).unwrap(), 0.0);
-        assert_eq!(timing.predict_prefill_ms(99, 128, 128).unwrap(), 0.0);
+        let empty = timing
+            .predict_phase_evidence(0, 128, 1, 0, "static_ctx")
+            .unwrap();
+        for seeded in [false, true] {
+            if seeded {
+                timing.predict_prefill_ms(2, 128, 0).unwrap();
+                timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
+            }
+            let before = timing.evidence_summary();
+            let calls = Python::with_gil(|py| {
+                engine
+                    .borrow(py)
+                    .calls
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            });
+            for _ in 0..2 {
+                assert_eq!(timing.predict_prefill_ms(0, 128, 0).unwrap(), 0.0);
+                assert_eq!(timing.predict_decode_ms(0, 0, 128, 16384).unwrap(), 0.0);
+                assert_eq!(timing.predict_prefill_ms(99, 128, 128).unwrap(), 0.0);
+                assert!(Arc::ptr_eq(
+                    &empty,
+                    &timing
+                        .predict_phase_evidence(99, 128, 1, 128, "static_ctx")
+                        .unwrap()
+                ));
+                assert_eq!(timing.evidence_summary(), before);
+            }
+            Python::with_gil(|py| {
+                assert_eq!(
+                    engine
+                        .borrow(py)
+                        .calls
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    calls
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn native_evidence_builder_matches_checked_values_and_errors() {
+        let row = |name: &str, latency, energy, source| (name.to_owned(), latency, energy, source);
+        let mut cases = vec![Vec::new(), vec![row("zero", -0.0, -0.0, "unknown")]];
+        for count in [1, 24, 32] {
+            cases.push(
+                (0..count)
+                    .map(|i| {
+                        row(
+                            &format!("op-{i}"),
+                            [0.1, 1e8, -0.0, f64::MIN_POSITIVE][i % 4],
+                            [0.0, 1e9, -0.0, 0.1][i % 4],
+                            ["silicon", "empirical", "sol", "estimated", "mixed", "other"][i % 6],
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            cases.push(vec![row("invalid", invalid, 1.0, "silicon")]);
+            cases.push(vec![row("invalid", 1.0, invalid, "silicon")]);
+            // The raw-energy error precedes both name and latency errors.
+            cases.push(vec![row("", invalid, invalid, "other")]);
+        }
+        cases.push(vec![row("", 1.0, 1.0, "silicon")]);
+        for (latency, energy) in [(f64::MAX, 0.0), (1.0, f64::MAX)] {
+            let overflow = vec![
+                row("first", latency, energy, "silicon"),
+                row("second", latency, energy, "silicon"),
+            ];
+            cases.push(overflow.clone());
+            let mut later_error = overflow;
+            later_error.push(row("later", f64::NAN, 1.0, "silicon"));
+            cases.push(later_error);
+        }
+        let assert_bits = |actual: &TimingPhaseEvidence, expected: &TimingPhaseEvidence| {
+            assert_eq!(actual, expected);
+            let bits = |phase: &TimingPhaseEvidence| {
+                std::iter::once((phase.latency_ms, phase.energy_wms, phase.covered_latency_ms))
+                    .chain(
+                        phase
+                            .operations
+                            .iter()
+                            .map(|op| (op.latency_ms, op.energy_wms, op.covered_latency_ms)),
+                    )
+                    .map(|(latency, energy, covered)| {
+                        (
+                            latency.to_bits(),
+                            energy.map(f64::to_bits),
+                            covered.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(actual), bits(expected));
+            assert_eq!(actual.coverage().to_bits(), expected.coverage().to_bits());
+            let a = phase_power_stats(actual).unwrap();
+            let b = phase_power_stats(expected).unwrap();
+            assert_eq!(a.power_w.map(f64::to_bits), b.power_w.map(f64::to_bits));
+            assert_eq!(a.coverage.to_bits(), b.coverage.to_bits());
+        };
+        pyo3::prepare_freethreaded_python();
+        let mut timing = Python::with_gil(|py| python_timing_model(py.None(), false));
+        timing.phase_provider = AicPhaseProvider::NativeEntries(vec![row("seed", 1.0, 2.0, "sol")]);
+        timing.predict_decode_ms(1, 65, 64, 1024).unwrap();
+        let cached = timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap();
+        let before = timing.evidence_summary().unwrap();
+        timing.phase_provider = AicPhaseProvider::NativeEntries(Vec::new());
+        for _ in 0..2 {
+            let error = timing.predict_decode_ms(1, 129, 128, 1024).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "AIC static_gen returned empty operation evidence for nonzero work"
+            );
+            assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+            assert!(Arc::ptr_eq(
+                &cached,
+                &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+            ));
+            let after = timing.evidence_summary().unwrap();
+            assert_bits(&after.prefill, &before.prefill);
+            assert_bits(&after.decode, &before.decode);
+        }
+        for entries in cases {
+            let checked = phase_evidence_from_entries(
+                entries
+                    .iter()
+                    .map(|(name, latency, energy, source)| {
+                        (name.clone(), *latency, *energy, (*source).to_owned())
+                    })
+                    .collect(),
+            );
+            let native = phase_evidence_from_native_entries(entries.clone());
+            match (native, checked) {
+                (Ok(native), Ok(checked)) => assert_bits(native.as_phase(), checked.as_phase()),
+                (Err(native), Err(checked)) => {
+                    assert_eq!(native.to_string(), checked.to_string());
+                    timing.phase_provider = AicPhaseProvider::NativeEntries(entries);
+                    for _ in 0..2 {
+                        let error = timing.predict_decode_ms(1, 129, 128, 1024).unwrap_err();
+                        assert_eq!(error.to_string(), checked.to_string());
+                        assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+                        assert!(Arc::ptr_eq(
+                            &cached,
+                            &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+                        ));
+                        let after = timing.evidence_summary().unwrap();
+                        assert_bits(&after.prefill, &before.prefill);
+                        assert_bits(&after.decode, &before.decode);
+                    }
+                }
+                mismatch => panic!("native builder mismatch: {mismatch:?}"),
+            }
+        }
     }
 
     #[test]
     fn python_evidence_rejects_invalid_energy_before_missing_value_conversion() {
         let error =
-            phase_evidence_from_python(vec![("bad".into(), 1.0, f64::NAN, "silicon".into())])
+            phase_evidence_from_entries(vec![("bad".into(), 1.0, f64::NAN, "silicon".into())])
                 .unwrap_err();
         assert!(error.to_string().contains("invalid energy"));
     }
 
     #[test]
     fn json_bindings_share_report_and_retain_request_correlation() {
-        let spec = ReplaySpec {
+        let mut spec = ReplaySpec {
             version: 1,
             topology: ReplayTopology::Aggregated {
                 workers: WorkerPoolSpec::default(),
@@ -2744,5 +3950,28 @@ mod tests {
             captured["artifacts"]["requests"][0]["request_id"],
             captured["report"]["per_request"][0]["uuid"]
         );
+
+        spec.requests.clear();
+        for record_per_request in [false, true] {
+            spec.record_per_request = record_per_request;
+            let payload = serde_json::to_string(&spec).unwrap();
+            for capture_artifacts in [false, true] {
+                let output: serde_json::Value =
+                    serde_json::from_str(&execute_json(&payload, capture_artifacts).unwrap())
+                        .unwrap();
+                let report = if capture_artifacts {
+                    &output["report"]
+                } else {
+                    &output
+                };
+                assert_eq!(report["completed_requests"], 0);
+                assert!(report.get("agentic_phases").is_none());
+                if record_per_request {
+                    assert_eq!(report["per_request"], serde_json::json!([]));
+                } else {
+                    assert!(report.get("per_request").is_none());
+                }
+            }
+        }
     }
 }

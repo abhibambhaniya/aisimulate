@@ -59,7 +59,7 @@ impl FpmPhase {
 
 /// One whole-model forward pass for a single phase.
 ///
-/// `match_identity` is the 11-string cell identity in
+/// `match_identity` is the 19-string cell identity (legacy schema-6 requests use 15) in
 /// [`FPM_CELL_MATCH_COLUMNS`](crate::perf_database::fpm_forward::FPM_CELL_MATCH_COLUMNS)
 /// order, computed by the PYTHON producer via `_norm_identity` (None -> "",
 /// Enum -> `.name`) so Rust compares strings verbatim with no re-normalization
@@ -91,6 +91,10 @@ pub struct FpmForwardOp {
     #[serde(default = "default_verify_width")]
     pub verify_width: u32,
     pub sol_ops: Vec<Op>,
+    /// Present only for an explicit table selector. Preserves the model's mode
+    /// before match_identity[2] was selected; it is NOT observed runtime precision.
+    #[serde(default)]
+    pub original_fmha_quant_mode: Option<String>,
 }
 
 fn default_verify_width() -> u32 {
@@ -114,6 +118,22 @@ impl FpmForwardOp {
             ));
         }
         sol_total(&self.sol_ops, self.phase, db, coords)
+    }
+
+    fn select_cell<'a>(&self, db: &'a PerfDatabase) -> Result<&'a FpmForwardCell, AicError> {
+        // Exact matching remains authoritative, including the recorded FMHA label.
+        // A different precision cell is a miss; the selector never rewrites it.
+        let cell = db
+            .fpm_forward
+            .select_cell(&self.match_identity, &self.model_path)?;
+        if let Some(original) = &self.original_fmha_quant_mode {
+            if let Some(warning) = cell.fmha_selector_warning(original) {
+                // The perfmodel has no installed logging facade. Emit a visible,
+                // once-per-cell/model-mode warning rather than a silent log record.
+                eprintln!("WARNING: {warning}");
+            }
+        }
+        Ok(cell)
     }
 
     /// Mirror of Python `FPMForwardOp.query`: validate kwargs, map to
@@ -150,9 +170,7 @@ impl FpmForwardOp {
                 ctx.beam_width
             )));
         }
-        let cell = db
-            .fpm_forward
-            .select_cell(&self.match_identity, &self.model_path)?;
+        let cell = self.select_cell(db)?;
         let b = batch_size as f64;
         let coords: Vec<f64> = match self.phase {
             FpmPhase::Prefill => {
@@ -196,9 +214,7 @@ impl FpmForwardOp {
                 coords
             )));
         }
-        let cell = db
-            .fpm_forward
-            .select_cell(&self.match_identity, &self.model_path)?;
+        let cell = self.select_cell(db)?;
         self.resolve(db, cell, coords)
     }
 
@@ -210,9 +226,7 @@ impl FpmForwardOp {
                 self.phase.as_str()
             )));
         }
-        let cell = db
-            .fpm_forward
-            .select_cell(&self.match_identity, &self.model_path)?;
+        let cell = self.select_cell(db)?;
         Ok(cell.decode_domain.as_ref().map(|domain| domain[1].1))
     }
 
@@ -243,9 +257,7 @@ impl FpmForwardOp {
                 "invalid FPM baseline query: batch_size={batch_size}"
             )));
         }
-        let cell = db
-            .fpm_forward
-            .select_cell(&self.match_identity, &self.model_path)?;
+        let cell = self.select_cell(db)?;
         let Some(domain) = cell.decode_domain else {
             return Err(data_err(format!(
                 "FPM cell {:?} has no decode rows (model_path={:?}).",
@@ -643,7 +655,7 @@ mod tests {
 
     const SYSTEMS_ROOT: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../python/aisimulate/src/aiconfigurator_core/systems"
+        "/../../python/aisimulate/src/aisimulate_core/systems"
     );
 
     /// A PerfDatabase whose fpm_forward table points at a temp pair; the rest
@@ -674,6 +686,7 @@ mod tests {
             match_identity: default_identity(4),
             weight_bytes: 0.0,
             verify_width: 1,
+            original_fmha_quant_mode: None,
             // Empty sol_ops: exact hits and in-curve lerps never call SOL.
             sol_ops: vec![],
         }
@@ -1318,6 +1331,84 @@ mod tests {
         assert!((b - blend).abs() < 1e-12, "{b}");
     }
 
+    #[test]
+    fn hopper_dsv41_roofline_supports_fpm_site_transfer_without_fp4_hardware() {
+        use crate::operators::Dsv41AttentionOp;
+        use crate::operators::dsv41::Dsv41KvCacheLayout;
+
+        // Synthetic table-selection fixture, not measured Hopper timings.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pair(tmp.path(), &default_rows());
+        let hardware =
+            std::fs::read_to_string(std::path::Path::new(SYSTEMS_ROOT).join("h200_sxm.yaml"))
+                .unwrap();
+        let hardware_db = |known_sm: bool| {
+            let root = tmp.path().join(if known_sm { "hopper" } else { "unknown" });
+            std::fs::create_dir_all(&root).unwrap();
+            let mut yaml: serde_yaml::Value = serde_yaml::from_str(&hardware).unwrap();
+            if !known_sm {
+                yaml["gpu"].as_mapping_mut().unwrap().remove("sm_version");
+            }
+            std::fs::write(
+                root.join("h200_sxm.yaml"),
+                serde_yaml::to_string(&yaml).unwrap(),
+            )
+            .unwrap();
+            let mut db = PerfDatabase::load_with_sources_opts(
+                &root,
+                "h200_sxm",
+                "sglang",
+                "dev-test",
+                &Default::default(),
+                true,
+            )
+            .unwrap();
+            db.set_fpm_forward_for_test(crate::perf_database::FpmForwardTable::new(
+                tmp.path().to_path_buf(),
+                "b200_sxm",
+                "vllm",
+                "0.25.1",
+            ));
+            db
+        };
+        let db = hardware_db(true);
+        assert_eq!(db.system_spec.gpu.sm_version, Some(90));
+        assert!(db.system_spec.gpu.fp4_tc_flops.is_none());
+        let mut o = op(FpmPhase::Decode);
+        o.sol_ops = vec![Op::Dsv41Attention(Dsv41AttentionOp {
+            name: "native_hopper_attention".into(),
+            is_context: false,
+            role: "reindex".into(),
+            compress_ratio: 1,
+            hidden_size: 5120,
+            num_heads: 32,
+            head_dim: 512,
+            q_lora_rank: 1280,
+            o_lora_rank: 1024,
+            o_groups: 4,
+            index_n_heads: 32,
+            index_head_dim: 128,
+            index_topk: 512,
+            window_size: 128,
+            candidate_limit: 0,
+            is_candidate_source: false,
+            bounded_prefill: false,
+            gemm_quant_mode: crate::common::enums::GemmQuantMode::Fp8Block,
+            fmha_quant_mode: crate::common::enums::FmhaQuantMode::Fp8,
+            kv_cache_layout: Dsv41KvCacheLayout::SglangFp8Bf16,
+        })];
+        assert_eq!(o.query(&db, &ctx(8, 512, 0)).unwrap().latency_ms, 7.0);
+        // Batch12 is absent, so this exercises the SOL-dependent site path.
+        let result = o.query(&db, &ctx(12, 512, 0)).unwrap();
+        assert!(result.latency_ms.is_finite() && result.latency_ms > 0.0);
+        assert_eq!(result.source, Source::Silicon);
+        // An unspecified architecture must not silently acquire SM90 support.
+        let db = hardware_db(false);
+        assert_eq!(o.query(&db, &ctx(8, 512, 0)).unwrap().latency_ms, 7.0);
+        let error = o.query(&db, &ctx(12, 512, 0)).unwrap_err();
+        assert!(error.to_string().contains("fp4_tc_flops"), "{error}");
+    }
+
     /// SOL support is lazy (mirrors Python, whose SOL view answers every op
     /// family): an unported family (e.g. the MLA-BMM module used below)
     /// must NOT block exact hits or in-curve lerps — only sol-dependent
@@ -1374,5 +1465,61 @@ mod tests {
                     .contains("verify_width")
             );
         }
+    }
+    #[test]
+    fn selector_warning_preserves_values_and_rejects_wrong_recorded_precision() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pair(tmp.path(), &default_rows());
+        let db = db_with_pair(tmp.path());
+        let mut selected = op(FpmPhase::Decode);
+        // Independent original model mode differs from the recorded table label.
+        selected.original_fmha_quant_mode = Some("fp8".into());
+        let cell = db
+            .fpm_forward
+            .select_cell(&selected.match_identity, &selected.model_path)
+            .unwrap();
+        let message = cell.fmha_selector_warning("fp8").unwrap();
+        assert!(message.contains("original_model_mode=\"fp8\""));
+        assert!(message.contains("selector=\"bfloat16\""));
+        assert!(message.contains(&format!("matched_cell_ids={:?}", cell.cell_ids)));
+        assert!(message.contains("does not independently verify runtime attention precision"));
+        assert!(cell.fmha_selector_warning("fp8").is_none());
+        assert!(cell.fmha_selector_warning("float16").is_some());
+        let base = op(FpmPhase::Decode);
+        let coords = [8.0, 4096.0];
+        assert_eq!(
+            selected.query_totals(&db, &coords).unwrap(),
+            base.query_totals(&db, &coords).unwrap()
+        );
+        selected.match_identity[2] = "fp8".into();
+        // All query routes retain exact matching; no substitution for table precision.
+        assert!(
+            selected
+                .query(&db, &ctx(4, 1024, 0))
+                .unwrap_err()
+                .to_string()
+                .contains("No FPM cell matches")
+        );
+        assert!(
+            selected
+                .query_totals(&db, &coords)
+                .unwrap_err()
+                .to_string()
+                .contains("No FPM cell matches")
+        );
+        assert!(
+            selected
+                .query_pass_baseline(&db, 4, 4096.0)
+                .unwrap_err()
+                .to_string()
+                .contains("No FPM cell matches")
+        );
+        assert!(
+            selected
+                .decode_kv_ceiling(&db)
+                .unwrap_err()
+                .to_string()
+                .contains("No FPM cell matches")
+        );
     }
 }

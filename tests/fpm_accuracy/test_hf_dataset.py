@@ -50,6 +50,9 @@ def _build_dataset(
     evidence_format_id: str | None = None,
     include_fpm: bool = True,
     dp: int = 1,
+    tp: int = 1,
+    dcp: int | None = None,
+    fpm_schema_version: int = 6,
 ) -> HfDataset:
     measurement_entries = []
     for index, (role, suffix, content) in enumerate(files):
@@ -99,13 +102,31 @@ def _build_dataset(
             "weight_quantization": "bfloat16",
             "kv_cache_dtype": "bfloat16",
             "parallel_strategy": "single",
-            "tp": 1,
+            "tp": tp,
             "pp": 1,
             "dp": dp,
-            "moe_tp": 1,
+            "moe_tp": tp,
             "moe_ep": 1,
             "cp": 1,
         }
+        if dcp is not None:
+            configuration_selector["dcp"] = dcp
+        if fpm_schema_version == 7:
+            configuration_selector.update(
+                gemm_quant_mode="bfloat16",
+                moe_quant_mode="bfloat16",
+                fmha_quant_mode="bfloat16",
+                comm_quant_mode="half",
+                moe_backend="auto",
+                attention_backend="auto",
+                enable_wideep=False,
+                enable_eplb=False,
+                model_config_sha256="b" * 64,
+                execution_profile="decoder_bounded",
+                input_modality="text",
+                engram_residency="hbm_tp_sharded",
+                fmha_resolution="checkpoint_native",
+            )
         fpm_relative = f"{CONFIGURATION_PATH}/fpm/fpm.parquet"
         fpm_path = root / fpm_relative
         fpm_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +144,7 @@ def _build_dataset(
                 "parquet_sha256": fpm_hash,
                 "row_count": 1,
                 "schema_name": "aic_fpm_forward_perf",
-                "schema_version": 6,
+                "schema_version": fpm_schema_version,
                 "configuration_selector": configuration_selector,
             },
         )
@@ -152,10 +173,10 @@ def _build_dataset(
         "framework_version": "1.0",
         "parallelism": "single",
         "parallel_strategy": "single",
-        "tp": 1,
+        "tp": tp,
         "pp": 1,
         "dp": dp,
-        "moe_tp": 1,
+        "moe_tp": tp,
         "moe_ep": 1,
         "cp": 1,
         "weight_quantization": "bfloat16",
@@ -170,6 +191,8 @@ def _build_dataset(
             "file_count": len(measurement_entries),
         },
     }
+    if dcp is not None:
+        configuration_manifest["dcp"] = dcp
     if evidence_format_id is not None:
         configuration_manifest["measurements"]["evidence_format_id"] = evidence_format_id
     _write_json(root / config_manifest_path, configuration_manifest)
@@ -183,6 +206,74 @@ def _build_dataset(
         },
     )
     return HfDataset.from_local(root, revision=REVISION)
+
+
+@pytest.mark.parametrize("broken_history", ["unreferenced", "bad_hash"])
+def test_current_campaign_is_independent_of_archived_snapshots(tmp_path, broken_history):
+    _build_dataset(tmp_path, protocol_id="forward-pass-record-v1", files=[])
+    history_path = "data/history/retired/manifest.json"
+    _write_json(tmp_path / history_path, {"snapshot_status": "historical"})
+    index_path = tmp_path / "catalog/index.json"
+    index = json.loads(index_path.read_text())
+    index["history_manifests"] = [history_path]
+    _write_json(index_path, index)
+    if broken_history == "bad_hash":
+        manifest_path = tmp_path / CONFIGURATION_PATH / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["history"] = [{"manifest_path": history_path, "manifest_sha256": "0" * 64}]
+        _write_json(manifest_path, manifest)
+    dataset = HfDataset.from_local(tmp_path, revision=REVISION)
+
+    # Exercise the same list -> explicit snapshot selection used by the daily runner.
+    configurations = dataset.configurations()
+    assert len(configurations) == 1
+    configuration = configurations[0]
+    case = dataset.measurement_case(configuration.configuration_path, snapshot_id=configuration.snapshot_id)
+    assert case.configuration.configuration_id == configuration.configuration_id
+    assert dataset.measurement_case(CONFIGURATION_PATH).configuration == configuration
+
+    # A current-only cache must never bypass validation when history is requested.
+    error = "current-manifest hash pointer" if broken_history == "unreferenced" else "hash mismatch"
+    for _ in range(2):
+        with pytest.raises(DataError, match=error):
+            dataset.configurations(include_history=True)
+    assert dataset.configurations() == configurations
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+def test_history_cache_does_not_expand_current_campaign_membership(tmp_path, with_override):
+    _build_dataset(tmp_path, protocol_id="forward-pass-record-v1", files=[])
+    manifest_path = tmp_path / CONFIGURATION_PATH / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    history_path = "data/history/retired/manifest.json"
+    historical = {**manifest, "snapshot_status": "historical", "snapshot_id": "older"}
+    measurement_path = "data/history/retired/measurements/manifest.json"
+    measurement = json.loads((tmp_path / manifest["measurements"]["manifest_path"]).read_text())
+    measurement.update(snapshot_status="historical", snapshot_id="older")
+    _write_json(tmp_path / measurement_path, measurement)
+    historical["measurements"] = {
+        **historical["measurements"],
+        "manifest_path": measurement_path,
+        "manifest_sha256": _sha256(tmp_path / measurement_path),
+    }
+    _write_json(tmp_path / history_path, historical)
+    manifest["history"] = [{"manifest_path": history_path, "manifest_sha256": _sha256(tmp_path / history_path)}]
+    _write_json(manifest_path, manifest)
+    index_path = tmp_path / "catalog/index.json"
+    index = json.loads(index_path.read_text())
+    index["history_manifests"] = [history_path]
+    _write_json(index_path, index)
+    override = None
+    if with_override:
+        override = tmp_path / "overrides.yaml"
+        override.write_text(
+            f"version: 1\noverrides:\n  - configuration_path: {CONFIGURATION_PATH}\n"
+            "    snapshot_id: older\n    worker_role: decode\n"
+        )
+    dataset = HfDataset.from_local(tmp_path, revision=REVISION, overrides_path=override)
+    assert dataset.measurement_case(CONFIGURATION_PATH, snapshot_id="older").configuration.snapshot_id == "older"
+    assert len(dataset.configurations(include_history=True)) == 2
+    assert [item.snapshot_id for item in dataset.configurations()] == [SNAPSHOT_ID]
 
 
 @pytest.mark.parametrize(
@@ -209,6 +300,51 @@ def test_duplicate_hf_json_keys_fail_even_with_matching_hashes(tmp_path, relativ
     with pytest.raises(DataError, match="duplicate JSON key"):
         dataset = HfDataset.from_local(tmp_path, revision=REVISION)
         dataset.measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize("dcp", [None, 1, 8])
+def test_dcp_identity_preserves_legacy_and_explicit_values(tmp_path, dcp):
+    dataset = _build_dataset(tmp_path, protocol_id=None, files=[], tp=8, dcp=dcp)
+    case = dataset.measurement_case(CONFIGURATION_PATH)
+    assert case.configuration.worker_config_record.config.parallelism.decode_context_parallel_size == (dcp or 1)
+
+
+@pytest.mark.parametrize("source", ["selector", "parquet"])
+@pytest.mark.parametrize("value", [None, 1, True])
+def test_dcp_identity_must_match_all_pinned_evidence(tmp_path, source, value):
+    dataset = _build_dataset(tmp_path, protocol_id=None, files=[], tp=8, dcp=8)
+    leaf = tmp_path / CONFIGURATION_PATH
+    metadata = json.loads((leaf / "fpm/fpm.metadata.json").read_text())
+    manifest = json.loads((leaf / "manifest.json").read_text())
+    if source == "selector":
+        if value is None:
+            metadata["configuration_selector"].pop("dcp")
+        else:
+            metadata["configuration_selector"]["dcp"] = value
+    else:
+        parquet_path = leaf / "fpm/fpm.parquet"
+        table = pq.read_table(parquet_path).to_pydict()
+        if value is None:
+            table.pop("dcp")
+        else:
+            table["dcp"] = [value]
+        pq.write_table(pa.table(table), parquet_path)
+        metadata["parquet_sha256"] = manifest["fpm"][0]["sha256"] = _sha256(parquet_path)
+    _write_json(leaf / "fpm/fpm.metadata.json", metadata)
+    _write_json(leaf / "manifest.json", manifest)
+    with pytest.raises(DataError, match="different configuration|missing configuration identity"):
+        dataset.measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "8", None])
+def test_invalid_manifest_dcp_fails_closed(tmp_path, value):
+    dataset = _build_dataset(tmp_path, protocol_id=None, files=[])
+    path = tmp_path / CONFIGURATION_PATH / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["dcp"] = value
+    _write_json(path, manifest)
+    with pytest.raises(DataError, match="dcp"):
+        dataset.configurations()
 
 
 def _fpm_payload(*, rank: int = 0, counter: int = 1, wall_time: float = 0.01) -> dict[str, object]:
@@ -1328,12 +1464,14 @@ def test_fpm_physical_row_count_is_verified(tmp_path: Path) -> None:
         dataset.measurement_case(CONFIGURATION_PATH)
 
 
-def test_fpm_sidecar_selector_must_match_selected_configuration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fpm_schema_version", [6, 7])
+def test_fpm_sidecar_selector_must_match_selected_configuration(tmp_path: Path, fpm_schema_version) -> None:
     content = f"{json.dumps(_fpm_payload())}\n".encode()
     dataset = _build_dataset(
         tmp_path,
         protocol_id="forward-pass-measurement-v1",
         files=[("truth", "truth.jsonl", content)],
+        fpm_schema_version=fpm_schema_version,
     )
     metadata_path = tmp_path / CONFIGURATION_PATH / "fpm/fpm.metadata.json"
     metadata = json.loads(metadata_path.read_text())
@@ -1341,6 +1479,70 @@ def test_fpm_sidecar_selector_must_match_selected_configuration(tmp_path: Path) 
     _write_json(metadata_path, metadata)
 
     with pytest.raises(DataError, match="selects a different configuration"):
+        dataset.measurement_case(CONFIGURATION_PATH)
+
+
+def test_v7_execution_identity_must_match_parquet(tmp_path):
+    dataset = _build_dataset(tmp_path, protocol_id="forward-pass-record-v1", files=[], fpm_schema_version=7)
+    metadata_path = tmp_path / CONFIGURATION_PATH / "fpm/fpm.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["configuration_selector"]["execution_profile"] = "full"
+    _write_json(metadata_path, metadata)
+    with pytest.raises(DataError, match="contains rows for a different configuration.*execution_profile"):
+        dataset.measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_config_sha256", []),
+        ("model_config_sha256", "not-a-hash"),
+        ("model_config_sha256", "A" * 64),
+        ("model_config_sha256", "a" * 63),
+        ("enable_wideep", 1),
+        ("enable_eplb", "false"),
+        ("execution_profile", []),
+        ("execution_profile", " "),
+        ("input_modality", None),
+        ("engram_residency", ""),
+        ("fmha_resolution", False),
+        ("gemm_quant_mode", []),
+        ("moe_quant_mode", 1),
+        ("fmha_quant_mode", ""),
+        ("comm_quant_mode", []),
+        ("moe_backend", " "),
+        ("attention_backend", []),
+    ],
+)
+def test_malformed_v7_selector_fails_even_when_parquet_agrees(tmp_path, field, value):
+    _build_dataset(tmp_path, protocol_id="forward-pass-record-v1", files=[], fpm_schema_version=7)
+    fpm_path = tmp_path / CONFIGURATION_PATH / "fpm/fpm.parquet"
+    table = pq.read_table(fpm_path)
+    table = table.set_column(table.schema.get_field_index(field), field, pa.array([value]))
+    pq.write_table(table, fpm_path)
+    metadata_path = tmp_path / CONFIGURATION_PATH / "fpm/fpm.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["configuration_selector"][field] = value
+    metadata["parquet_sha256"] = _sha256(fpm_path)
+    _write_json(metadata_path, metadata)
+    manifest_path = tmp_path / CONFIGURATION_PATH / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["fpm"][0]["sha256"] = _sha256(fpm_path)
+    _write_json(manifest_path, manifest)
+
+    dataset = HfDataset.from_local(tmp_path, revision=REVISION)
+    with pytest.raises(DataError, match=f"invalid v7 selector field '{field}'"):
+        dataset.measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize("version", [8, "7", 7.0, {"version": 7}])
+def test_unknown_or_malformed_fpm_schema_fails_closed(tmp_path, version):
+    dataset = _build_dataset(tmp_path, protocol_id="forward-pass-record-v1", files=[])
+    metadata_path = tmp_path / CONFIGURATION_PATH / "fpm/fpm.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["schema_version"] = version
+    _write_json(metadata_path, metadata)
+    with pytest.raises(DataError, match="unsupported schema"):
         dataset.measurement_case(CONFIGURATION_PATH)
 
 

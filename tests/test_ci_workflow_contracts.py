@@ -40,7 +40,7 @@ WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
 
 
-def test_release_migration_gate_blocks_publication_until_reviewed_clearance(tmp_path):
+def test_stable_release_migrations_require_reviewed_clearance(tmp_path):
     from scripts.check_release_migrations import GATES, require_completed_migrations
 
     with pytest.raises(RuntimeError, match="dynamo/pull/14065"):
@@ -56,25 +56,29 @@ def test_release_migration_gate_blocks_publication_until_reviewed_clearance(tmp_
     with pytest.raises(FileNotFoundError):
         require_completed_migrations(path)
 
-    jobs = _workflow("nightly-ci.yml")["jobs"]
+
+def test_nightly_can_publish_the_wheel_needed_by_pending_downstream_migrations():
+    workflow = _workflow("nightly-ci.yml")
+    serialized_workflow = json.dumps(workflow)
+    assert "check_release_migrations.py" not in serialized_workflow
+    assert "release-gates.json" not in serialized_workflow
+    jobs = workflow["jobs"]
     guard = jobs["changes-guard"]
-    index = next(i for i, step in enumerate(guard["steps"]) if "check_release_migrations.py" in step.get("run", ""))
-    assert next(i for i, step in enumerate(guard["steps"]) if step.get("id") == "target") < index
-    assert index < next(i for i, step in enumerate(guard["steps"]) if step.get("id") == "decide")
-    assert "if" not in guard["steps"][index]
-    checkouts = [step for step in guard["steps"][:index] if step.get("uses", "").startswith("actions/checkout@")]
-    assert len(checkouts) == 2
-    assert checkouts[0]["with"]["ref"] == "${{ steps.target.outputs.sha }}"
-    assert "path" not in checkouts[0]["with"]
-    assert checkouts[1]["with"]["ref"] == "${{ github.sha }}"
-    assert checkouts[1]["with"]["path"] == "release-policy"
-    assert all("if" not in step and step["with"]["persist-credentials"] == "false" for step in checkouts)
-    assert guard["steps"][index]["run"] == (
-        "python3 release-policy/scripts/check_release_migrations.py --target-gates .github/release-gates.json"
-    )
-    assert "build-artifacts" in jobs["trigger-gitlab-security"]["needs"]
-    assert "changes-guard" in jobs["build-artifacts"]["needs"]
-    assert "needs.changes-guard.outputs.should-build == 'true'" in jobs["build-artifacts"]["if"]
+    commands = "\n".join(_run_commands(job) for job in jobs.values() if "steps" in job)
+    assert "check_release_migrations.py" not in commands
+    assert "release-gates.json" not in commands
+    assert not any(step.get("uses", "").startswith("actions/checkout@") for step in guard["steps"])
+    steps = [step.get("id") for step in guard["steps"]]
+    assert steps.index("target") < steps.index("version") < steps.index("decide")
+    assert guard["outputs"]["dev-version"] == "${{ steps.version.outputs.dev-version }}"
+    build = jobs["build-artifacts"]
+    assert "scripts/apply_dev_version.py" in _run_commands(build)
+    assert {"changes-guard", "manual-approval", "python-compliance"} <= set(build["needs"])
+    assert "needs.changes-guard.outputs.should-build == 'true'" in build["if"]
+    publish = jobs["trigger-gitlab-security"]
+    assert {"build-artifacts", "manual-approval", "fpe-support-matrix", "license-evidence"} <= set(publish["needs"])
+    for name in ("build-artifacts", "fpe-support-matrix", "license-evidence"):
+        assert f"needs.{name}.result == 'success'" in publish["if"]
 
 
 @pytest.mark.parametrize(
@@ -87,7 +91,7 @@ def test_release_migration_gate_blocks_publication_until_reviewed_clearance(tmp_
         ("clear", "malformed", 1),
     ],
 )
-def test_publication_checks_current_policy_and_selected_target(tmp_path, monkeypatch, current, target, expected):
+def test_stable_publication_checks_current_policy_and_selected_target(tmp_path, monkeypatch, current, target, expected):
     from scripts import check_release_migrations as checker
 
     paths = {}
@@ -181,6 +185,41 @@ def test_forward_perf_controller_change_detection(tmp_path, path, expected):
     assert forward_perf.matches_path(path) is expected
 
 
+@pytest.mark.parametrize("base_protocol", [1, 2])
+def test_forward_perf_skips_incompatible_data_policies(tmp_path, base_protocol):
+    steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
+    revisions = next(step for step in steps if step.get("id") == "revisions")["run"]
+    protocol_check = revisions.split('if [[ -z "${skip_reason}" ]]; then', 1)[1]
+    protocol_check = 'if [[ -z "${skip_reason}" ]]; then' + protocol_check.split("controller_changes=", 1)[0]
+    gate_path = "python/aisimulate/tools/forward_perf_gate"
+    _git(tmp_path, "init", "--quiet")
+    (tmp_path / gate_path).mkdir(parents=True)
+    base = _commit_file(tmp_path, f"{gate_path}/__init__.py", f"PROTOCOL_VERSION = {base_protocol}\n")
+    head = _commit_file(tmp_path, f"{gate_path}/__init__.py", "# Shared-layer reuse enabled.\nPROTOCOL_VERSION = 2\n")
+    output = tmp_path / "output"
+    summary = tmp_path / "summary"
+    subprocess.run(
+        ["bash", "-euc", protocol_check],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "base_sha": base,
+            "PR_HEAD_SHA": head,
+            "gate_path": gate_path,
+            "skip_reason": "",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        check=True,
+    )
+    if base_protocol == 1:
+        assert output.read_text() == "run_comparison=false\n"
+        assert "protocol versions differ: base is 1, head is 2" in summary.read_text()
+    else:
+        assert not output.exists()
+        assert not summary.exists()
+
+
 def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
     pull = {
         "head": {"sha": "a" * 40},
@@ -217,7 +256,7 @@ def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
                 [
                     {
                         "filename": "archive/old.py",
-                        "previous_filename": "python/aisimulate/src/aiconfigurator_core/foo.py",
+                        "previous_filename": "python/aisimulate/src/aisimulate_core/foo.py",
                     }
                 ]
             ],
@@ -248,11 +287,11 @@ def test_forward_perf_uses_complete_pr_files(pages, count, expected):
         ("Cargo.toml.bak", False),
         ("crates/core/src/engine/nested/predict.rs", True),
         ("crates/core/src/engine-other/predict.rs", False),
-        ("python/aisimulate/src/aiconfigurator_core/example.py", True),
-        ("python/aisimulate/src/aiconfigurator_core/unrelated/example.py", False),
-        ("python/aisimulate/src/aiconfigurator_core/systems/h100_sxm.yaml", True),
+        ("python/aisimulate/src/aisimulate_core/example.py", True),
+        ("python/aisimulate/src/aisimulate_core/unrelated/example.py", False),
+        ("python/aisimulate/src/aisimulate_core/systems/h100_sxm.yaml", True),
         (
-            "python/aisimulate/src/aiconfigurator_core/systems/unrelated/nested.yaml",
+            "python/aisimulate/src/aisimulate_core/systems/unrelated/nested.yaml",
             False,
         ),
     ],
@@ -713,6 +752,12 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert "test_engine_step_parity.py" in regression_commands
     assert "test_compile_engine_parity.py" in regression_commands
     assert regression_commands.count("-c python/aisimulate/pytest.ini") == 2
+    assert regression_commands.index("check_prediction_numerics.py --fetch-baseline-only") < regression_commands.index(
+        "check_prediction_numerics.py --output"
+    )
+    policy_commands = _run_commands(_workflow("fast-ci.yml")["jobs"]["policy"])
+    fetch = "check_prediction_numerics.py --fetch-baseline-only"
+    assert policy_commands.index(fetch) < policy_commands.index("tests/test_ci_qualification.py")
 
     feature_mode_commands = _run_commands(jobs["rust-feature-modes"])
     assert "cargo test --workspace --features embed-python,replay-bench" in feature_mode_commands
@@ -884,9 +929,9 @@ def test_platform_wheel_build_and_verifiers_cover_collector_payload() -> None:
     ).read_text()
 
     assert "COPY python/aisimulate/collector/ /workspace/python/aisimulate/collector/" in dockerfile
-    assert "ln -s ../src /workspace/python/aisimulate/aic-core/src" in dockerfile
-    assert "test -d /workspace/python/aisimulate/src/aiconfigurator/model_configs" in dockerfile
-    assert "test -d /workspace/python/aisimulate/src/aiconfigurator/systems" in dockerfile
+    assert "ln -s ../src" not in dockerfile
+    assert "test -d /workspace/python/aisimulate/src/aisimulate_core/model_configs" in dockerfile
+    assert "test -d /workspace/python/aisimulate/src/aisimulate_core/systems" in dockerfile
     assert '"cases/**/*.yaml"' in release_verifier
     assert '"fpm_forward/**/*.py"' in release_verifier
     assert '"collector/fpm_forward/runtime/fpm_exec.sh"' in installed_verifier
@@ -1042,7 +1087,6 @@ def test_prediction_gate_resolves_base_for_push_and_manual_callers(tmp_path: Pat
     [
         ("push", "refs/heads/main", "a" * 40, True),
         ("push", "refs/heads/release/0.12.0", "b" * 40, True),
-        ("push", "refs/heads/pull-request/96", "a" * 40, False),
         ("workflow_dispatch", "refs/heads/main", "a" * 40, False),
         ("workflow_dispatch", "refs/heads/codex/restore-migrated-ci", "", False),
         ("push", "refs/heads/release/0.12.0", "0" * 40, False),
@@ -1065,7 +1109,7 @@ def test_full_ci_comparison_base_fails_closed(tmp_path: Path, before: str, api_s
 
 
 def _run_comparison_base(
-    tmp_path: Path, event: str, ref: str, before: str, api_sha: str = "c" * 40, api_status: int = 0
+    tmp_path: Path, event: str, ref: str, before: str, api_sha: str = "c" * 40, api_status: int = 0, pr_base: str = ""
 ) -> tuple[subprocess.CompletedProcess, dict[str, str]]:
     jobs = _workflow("ci.yml")["jobs"]
     assert jobs["verify-target"]["outputs"]["comparison-base"] == "${{ steps.comparison-base.outputs.sha }}"
@@ -1073,6 +1117,7 @@ def _run_comparison_base(
         assert "verify-target" in jobs[name]["needs"]
         assert jobs[name]["with"][argument] == "${{ needs.verify-target.outputs.comparison-base }}"
     step = next(step for step in jobs["verify-target"]["steps"] if step.get("id") == "comparison-base")
+    assert step["env"]["PR_BASE_SHA"] == "${{ steps.pr-target.outputs.base }}"
     gh = tmp_path / "gh"
     gh.write_text(
         '#!/bin/bash\n[[ "$*" == "api -X GET repos/ai-dynamo/aisimulate/commits/main --jq .sha" ]] || exit 9\n'
@@ -1088,6 +1133,7 @@ def _run_comparison_base(
             "GITHUB_EVENT_NAME": event,
             "GITHUB_REF": ref,
             "BEFORE_SHA": before,
+            "PR_BASE_SHA": pr_base,
             "REPOSITORY": "ai-dynamo/aisimulate",
             "GITHUB_OUTPUT": str(output_path),
             "GH_CALLED": str(tmp_path / "gh-called"),
@@ -1099,6 +1145,47 @@ def _run_comparison_base(
     )
     output = dict(line.split("=", 1) for line in output_path.read_text().splitlines()) if output_path.exists() else {}
     return result, output
+
+
+def _full_ci_concurrency_group(event: str, ref: str, run_id: str) -> str:
+    configuration = _workflow("ci.yml")["concurrency"]
+    assert configuration["cancel-in-progress"] == "true"
+    prefix, expression = configuration["group"].split("${{", 1)
+    expression = expression.rsplit("}}", 1)[0]
+    values = {
+        "github.event_name": event,
+        "github.ref": ref,
+        "github.run_id": run_id,
+    }
+    expression = re.sub(r"github\.[\w_]+", lambda match: repr(values[match[0]]), expression)
+    expression = expression.replace("&&", " and ").replace("||", " or ").replace("!startsWith", "not startsWith")
+    return prefix + str(
+        eval(
+            " ".join(expression.splitlines()),
+            {"__builtins__": {}},
+            {"startsWith": str.startswith},
+        )
+    )
+
+
+def test_full_ci_replaces_same_pr_across_trusted_and_manual_runs():
+    group = _full_ci_concurrency_group("push", "refs/heads/pull-request/159", "101")
+    assert group == _full_ci_concurrency_group("push", "refs/heads/pull-request/159", "102")
+    assert group == _full_ci_concurrency_group("workflow_dispatch", "refs/heads/pull-request/159", "103")
+    assert group != _full_ci_concurrency_group("push", "refs/heads/pull-request/160", "105")
+
+
+def test_full_ci_manual_source_branches_replace_only_their_branch():
+    group = _full_ci_concurrency_group("workflow_dispatch", "refs/heads/feature", "101")
+    assert group == _full_ci_concurrency_group("workflow_dispatch", "refs/heads/feature", "102")
+    assert group != _full_ci_concurrency_group("workflow_dispatch", "refs/heads/other-feature", "103")
+    assert group != _full_ci_concurrency_group("push", "refs/heads/pull-request/159", "104")
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/release/0.12.0", "refs/tags/v0.12.0"])
+def test_full_ci_preserves_every_lifecycle_and_tag_run(event, ref):
+    assert _full_ci_concurrency_group(event, ref, "101") != _full_ci_concurrency_group(event, ref, "102")
 
 
 def test_fast_ci_is_standalone_with_an_exact_commit_prerequisite() -> None:
@@ -1173,7 +1260,19 @@ def _run_pr_target(
 def test_full_ci_trusted_copy_validates_the_stacked_pr_base(tmp_path: Path) -> None:
     result, output = _run_pr_target(tmp_path, "a" * 40, "d" * 40)
     assert result.returncode == 0, result.stderr
-    assert output == {}
+    assert output == {"base": "d" * 40}
+
+
+@pytest.mark.parametrize("pr_base", ["d" * 40, "", "main", "d" * 39])
+def test_full_ci_stacked_comparison_uses_only_the_validated_pr_base(tmp_path: Path, pr_base: str) -> None:
+    result, output = _run_comparison_base(tmp_path, "push", "refs/heads/pull-request/235", "a" * 40, pr_base=pr_base)
+    if pr_base == "d" * 40:
+        assert result.returncode == 0, result.stderr
+        assert output == {"sha": pr_base}
+    else:
+        assert result.returncode != 0
+        assert output == {}
+    assert not (tmp_path / "gh-called").exists()
 
 
 @pytest.mark.parametrize(
@@ -1394,7 +1493,7 @@ def test_fpe_job_uses_required_container_without_legacy_lfs_data() -> None:
             "-C",
             str(REPOSITORY_ROOT),
             "ls-files",
-            "python/aisimulate/src/aiconfigurator_core/systems/**/*.txt",
+            "python/aisimulate/src/aisimulate_core/systems/**/*.txt",
         ],
         text=True,
     ).splitlines()
@@ -1805,7 +1904,7 @@ def test_full_ci_selector_maps_python_rust_and_data_boundaries() -> None:
     assert rust_plan["components"]["collector_data"] is True
     assert rust_plan["components"]["cargo_deny"] is False
 
-    data_plan = select_components(["python/aisimulate/src/aiconfigurator_core/systems/data/b200/op.parquet"])
+    data_plan = select_components(["python/aisimulate/src/aisimulate_core/systems/data/b200/op.parquet"])
     assert data_plan["components"]["collector_data"] is True
     assert data_plan["components"]["prediction_regression"] is True
     assert data_plan["components"]["engine_golden_regression"] is True
@@ -2072,6 +2171,34 @@ def test_release_artifact_handoffs_cannot_mix_versions():
                 .replace("${{ matrix.shard.backend }}", "vllm")
             )
             assert fnmatch.fnmatchcase(name, selected_pattern) == (version == selected)
+
+
+@pytest.mark.parametrize("manifest_version", ["0.13.0", "0.13.0.dev20260918"])
+@pytest.mark.parametrize("installed_matches", [True, False])
+def test_release_smoke_checks_manifest_version(tmp_path, monkeypatch, manifest_version, installed_matches):
+    import importlib.metadata
+
+    manifest = tmp_path / "python/aisimulate/pyproject.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(f'[project]\nversion = "{manifest_version}"\n')
+    monkeypatch.chdir(tmp_path)
+    installed_version = manifest_version if installed_matches else "0.12.0"
+    for name in ("aisimulate", "aisimulate_core"):
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace(__version__=installed_version))
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: installed_version)
+    monkeypatch.setattr(importlib.metadata, "distributions", lambda: [])
+    smoke = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["release-artifact-contract"]["steps"]
+        if "import importlib.metadata" in step.get("run", "")
+    )
+    command = shlex.split(smoke)
+    assert command[:2] == ["release-smoke/bin/python", "-c"]
+    if installed_matches:
+        exec(command[2], {})
+    else:
+        with pytest.raises(AssertionError):
+            exec(command[2], {})
 
 
 def _nightly_condition(job: str, *, cancelled: bool = False, **overrides) -> bool:

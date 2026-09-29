@@ -28,7 +28,7 @@ use crate::{
 
 fn systems_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../python/aisimulate/src/aiconfigurator_core/systems")
+        .join("../../python/aisimulate/src/aisimulate_core/systems")
 }
 
 const TEST_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
@@ -69,7 +69,8 @@ fn context_ops() -> Vec<Op> {
             scale_factor: 1.0,
             n: 4096,
             k: 4096,
-            quant_mode: GemmQuantMode::Fp8Block,
+            // 0.24.0's invalid FP8-block rows were removed; use its measured FP8 lane.
+            quant_mode: GemmQuantMode::Fp8,
             scale_num_tokens: 0,
             low_precision_input: false,
             seq_split: 1,
@@ -126,6 +127,9 @@ fn fixture_engine_config() -> EngineConfig {
         backend: BackendKind::Vllm,
         backend_version: Some("0.24.0".to_string()),
         forward_model: None,
+        fpm_parquet_path: None,
+        decoder_replay: false,
+        moe_kernel_source: None,
         kv_block_size: None,
         parallel: ParallelMapping {
             dcp_size: None,
@@ -140,6 +144,7 @@ fn fixture_engine_config() -> EngineConfig {
             weight_dtype: None,
             moe_dtype: None,
             activation_dtype: None,
+            fpm_fmha_dtype: None,
             kv_cache_dtype: None,
         },
         speculative: None,
@@ -1980,4 +1985,45 @@ fn native_model_starts_ready_with_aic_source() {
     assert_eq!(diag.source, ForwardPassPerfSource::Aic);
     assert_eq!(diag.readiness, ForwardPassPerfReadiness::Ready);
     assert_eq!(diag.retained_observations, 0);
+}
+
+#[test]
+fn canonical_static_phase_diagnostics_are_available_only_for_native_models() {
+    let model = native_model(ForwardPassPerfOptions::default());
+    let engine = model.native_engine().unwrap();
+    assert_eq!(
+        model.static_phase_latency(4, 512, 4, true).unwrap(),
+        engine.predict_prefill_latency(4, 512, 0).unwrap()
+    );
+    assert_eq!(
+        model.static_phase_latency(4, 512, 4, false).unwrap(),
+        engine.predict_decode_latency(4, 512, 4).unwrap()
+    );
+    assert!(
+        model
+            .static_phase_diagnostics(4, u32::MAX, 0, false)
+            .is_err()
+    );
+    assert!(model.static_phase_diagnostics(0, 128, 129, true).is_err());
+    let rows = model.static_phase_diagnostics(4, 512, 0, true).unwrap();
+    assert!(rows.iter().any(|row| row.details.sol.is_some()));
+    assert!(model.static_phase_diagnostics(4, 512, 513, true).is_err());
+    assert!(model.static_phase_diagnostics(4, 512, 1, false).is_err());
+    assert!(
+        model
+            .static_phase_diagnostics(4, 512, 512, true)
+            .unwrap()
+            .is_empty()
+    );
+    let regression = regression_model(
+        ForwardPassWorkerType::Aggregated,
+        ForwardPassPerfOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        regression
+            .static_phase_diagnostics(4, 512, 0, true)
+            .is_err()
+    );
+    assert!(regression.static_phase_latency(4, 512, 4, true).is_err());
 }

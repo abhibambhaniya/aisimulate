@@ -14,14 +14,14 @@ import sys
 
 import pytest
 
-import aiconfigurator_core
-import aiconfigurator_core.sdk as sdk
-from aiconfigurator_core.sdk.common import AttentionBackend, MoEBackend
-from aiconfigurator_core.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator_core.sdk.engine import EngineHandle, compile_engine
-from aiconfigurator_core.sdk.memory import estimate_kv_cache, estimate_num_gpu_blocks
-from aiconfigurator_core.sdk.operations import ElementWise, Embedding, MoEDispatch
-from aiconfigurator_core.sdk.rust_engine_step import RustForwardPassPerfModel
+import aisimulate_core
+import aisimulate_core.sdk as sdk
+from aisimulate_core.sdk.common import AttentionBackend, MoEBackend
+from aisimulate_core.sdk.config import ModelConfig, RuntimeConfig
+from aisimulate_core.sdk.engine import EngineHandle, compile_engine
+from aisimulate_core.sdk.memory import estimate_kv_cache, estimate_num_gpu_blocks, estimate_state_cache
+from aisimulate_core.sdk.operations import ElementWise, Embedding, MoEDispatch
+from aisimulate_core.sdk.rust_engine_step import RustForwardPassPerfModel
 
 EXPECTED_FACADE = {
     "AttentionBackend",
@@ -34,12 +34,13 @@ EXPECTED_FACADE = {
     "RustForwardPassPerfModel",
     "compile_engine",
     "estimate_kv_cache",
+    "estimate_state_cache",
     "estimate_num_gpu_blocks",
 }
 
 
 def _raw_regression_model(worker_type, options_json=None, *, cls=None):
-    cls = cls or aiconfigurator_core.RustForwardPassPerfModel
+    cls = cls or aisimulate_core.RustForwardPassPerfModel
     config = {
         "model": "test/model",
         "system": "test",
@@ -56,12 +57,12 @@ def test_sdk_facade_import_is_lazy_in_a_fresh_interpreter() -> None:
     script = """
 import sys
 
-import aiconfigurator_core.sdk
+import aisimulate_core.sdk
 
 protected_modules = {
-    "aiconfigurator_core.sdk.engine",
-    "aiconfigurator_core.sdk.memory",
-    "aiconfigurator_core.sdk.rust_engine_step",
+    "aisimulate_core.sdk.engine",
+    "aisimulate_core.sdk.memory",
+    "aisimulate_core.sdk.rust_engine_step",
 }
 loaded_modules = protected_modules.intersection(sys.modules)
 assert not loaded_modules, f"SDK facade eagerly loaded: {sorted(loaded_modules)}"
@@ -79,12 +80,13 @@ def test_sdk_facade_exports_the_canonical_objects() -> None:
     assert sdk.RustForwardPassPerfModel is RustForwardPassPerfModel
     assert sdk.compile_engine is compile_engine
     assert sdk.estimate_kv_cache is estimate_kv_cache
+    assert sdk.estimate_state_cache is estimate_state_cache
     assert sdk.estimate_num_gpu_blocks is estimate_num_gpu_blocks
 
 
 def test_native_and_ergonomic_fpm_classes_are_deliberately_distinct() -> None:
-    assert aiconfigurator_core.RustForwardPassPerfModel is not RustForwardPassPerfModel
-    assert RustForwardPassPerfModel.__module__ == "aiconfigurator_core.sdk.rust_engine_step"
+    assert aisimulate_core.RustForwardPassPerfModel is not RustForwardPassPerfModel
+    assert RustForwardPassPerfModel.__module__ == "aisimulate_core.sdk.rust_engine_step"
 
 
 def test_stable_function_signatures() -> None:
@@ -95,18 +97,25 @@ def test_stable_function_signatures() -> None:
         "moe_tp_size: 'int | None' = None, moe_ep_size: 'int | None' = None, "
         "gemm_quant_mode: 'str | None' = None, moe_quant_mode: 'str | None' = None, "
         "kvcache_quant_mode: 'str | None' = None, fmha_quant_mode: 'str | None' = None, "
+        "fpm_fmha_quant_mode: 'str | None' = None, "
         "comm_quant_mode: 'str | None' = None, attention_backend: 'str | None' = None, "
+        "moe_kernel_source: 'str | None' = None, "
+        "moe_backend: 'str | None' = None, enable_eplb: 'bool' = False, wideep_num_slots: 'int | None' = None, "
         "nextn: 'int' = 0, "
         "speculation: 'dict | None' = None, "
         "kv_block_size: 'int | None' = None, "
         "systems_path: 'str | None' = None, "
         "forward_model: 'str | None' = None, "
+        "decoder_replay: 'bool' = False, "
         "database_mode: 'str | None' = None, shared_layer: 'bool | None' = None, "
         "transfer_policy: 'str | list[str] | None' = None, "
-        "strict_provenance: 'bool | None' = None) -> 'bytes'"
+        "strict_provenance: 'bool | None' = None, fpm_parquet_path: 'str | None' = None) -> 'bytes'"
     )
     assert "scheduler_block_size" in inspect.signature(estimate_num_gpu_blocks).parameters
     assert "memory_fraction_kind" in inspect.signature(estimate_kv_cache).parameters
+    assert {"model_path", "backend", "tp_size", "pp_size", "kv_bytes_per_token"}.issubset(
+        inspect.signature(estimate_state_cache).parameters
+    )
     assert list(inspect.signature(RustForwardPassPerfModel.best_available).parameters) == ["config"]
     assert not hasattr(RustForwardPassPerfModel, "from_regression")
     assert not hasattr(RustForwardPassPerfModel, "from_native")
@@ -120,7 +129,7 @@ def test_raw_fpm_binding_rejects_worker_type_aliases(worker_type: str) -> None:
 
 def test_raw_fpm_binding_requires_worker_type() -> None:
     with pytest.raises(ValueError, match="worker_type"):
-        aiconfigurator_core.RustForwardPassPerfModel.best_available(
+        aisimulate_core.RustForwardPassPerfModel.best_available(
             json.dumps({"model": "m", "system": "s", "backend": "vllm"})
         )
 
@@ -281,16 +290,16 @@ def test_native_operation_constructors_preserve_legacy_keyword_names() -> None:
 
 
 def test_distribution_carries_typing_contract() -> None:
-    root = importlib.resources.files("aiconfigurator_core")
+    root = importlib.resources.files("aisimulate_core")
     assert (root / "py.typed").is_file()
-    assert (root / "_aiconfigurator_core.pyi").is_file()
+    assert (root / "_native.pyi").is_file()
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("namespace", ["aisimulate_core", "aiconfigurator_core"])
+@pytest.mark.parametrize("namespace", ["aisimulate_core", "aisimulate_core"])
 def test_regression_bucket_diagnostics_stub_matches_native_contract(namespace: str) -> None:
-    root = importlib.resources.files("aiconfigurator_core")
-    stub = ast.parse((root / "_aiconfigurator_core.pyi").read_text(encoding="utf-8"))
+    root = importlib.resources.files("aisimulate_core")
+    stub = ast.parse((root / "_native.pyi").read_text(encoding="utf-8"))
     model = next(
         node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "RustForwardPassPerfModel"
     )
@@ -313,10 +322,10 @@ def test_regression_bucket_diagnostics_stub_matches_native_contract(namespace: s
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("namespace", ["aisimulate_core", "aiconfigurator_core"])
+@pytest.mark.parametrize("namespace", ["aisimulate_core", "aisimulate_core"])
 def test_context_attention_kernel_stub_matches_native_contract(namespace: str) -> None:
-    root = importlib.resources.files("aiconfigurator_core")
-    stub = ast.parse((root / "_aiconfigurator_core.pyi").read_text(encoding="utf-8"))
+    root = importlib.resources.files("aisimulate_core")
+    stub = ast.parse((root / "_native.pyi").read_text(encoding="utf-8"))
     engine = next(node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "AicEngine")
     method_name = "evaluate_context_attention_kernels_json"
     method = next(
@@ -347,3 +356,61 @@ def test_context_attention_kernel_stub_matches_native_contract(namespace: str) -
         "visual_block_upper_triangle": "bool",
     }
     assert ast.unparse(method.returns) == "list[tuple[str, float, float, str]]"
+
+
+@pytest.mark.unit
+def test_static_phase_diagnostics_stub_matches_native_contract() -> None:
+    root = importlib.resources.files("aisimulate_core")
+    stub = ast.parse((root / "_native.pyi").read_text(encoding="utf-8"))
+    model = next(
+        node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "RustForwardPassPerfModel"
+    )
+    method = next(
+        node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "static_phase_diagnostics"
+    )
+    native_class = importlib.import_module("aisimulate_core").RustForwardPassPerfModel
+    parameters = inspect.signature(native_class.static_phase_diagnostics).parameters
+    assert [arg.arg for arg in method.args.args] == list(parameters)
+    assert {arg.arg: ast.unparse(arg.annotation) for arg in method.args.args[1:]} == {
+        "batch_size": "int",
+        "context_length": "int",
+        "prefix": "int",
+        "prefill": "bool",
+    }
+    assert ast.unparse(method.returns) == "str"
+    model = native_class.best_available(
+        json.dumps(
+            {
+                "model": "Qwen/Qwen3-32B",
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.24.0",
+                "worker_type": "aggregated",
+                "estimation_mode": "op_level",
+                "tp": 2,
+            }
+        )
+    )
+    # Zero scheduled work is an empty native JSON array, not a Python list.
+    result = model.static_phase_diagnostics(0, 128, 0, True)
+    assert isinstance(result, str)
+    assert json.loads(result) == []
+
+
+def test_state_memory_api_is_standalone_in_a_fresh_interpreter() -> None:
+    script = """
+import sys
+from aisimulate_core.sdk import estimate_state_cache
+result = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8)
+assert result["bytes_per_request"] == 61046784
+assert not {"aisimulate.config.engine", "vllm"}.intersection(sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_state_memory_public_paths_share_one_implementation() -> None:
+    from aisimulate import capacity
+    from aisimulate.sdk.memory import estimate_state_cache as legacy
+    from aisimulate_core.sdk.state_memory import estimate_state_cache as canonical
+
+    assert sdk.estimate_state_cache is estimate_state_cache is legacy is capacity.estimate_state_cache is canonical

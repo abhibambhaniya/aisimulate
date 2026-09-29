@@ -14,7 +14,7 @@ use aisimulate_core::replay::{
     ReplayComposition, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory, ReplayError,
     ReplayRequest, ReplayScalingDecision, ReplayScalingPolicy, ReplayScalingSnapshot, ReplaySpec,
     ReplayTelemetryObserver, ReplayTelemetrySampleKind, ReplayTelemetrySnapshot, ReplayTopology,
-    Replayer, WorkerPoolSpec, WorkerTopology,
+    Replayer, WorkerLifecycleTransitionKind, WorkerPool, WorkerPoolSpec, WorkerTopology,
 };
 use uuid::Uuid;
 
@@ -101,12 +101,185 @@ impl ReplayTelemetryObserver for FailingTelemetryObserver {
 }
 
 #[test]
+fn replay_accept_length_counts_decode_work_before_output_truncation() {
+    for backend in [Backend::Vllm, Backend::Sglang] {
+        for (rates, lengths, forwards, expected_average) in [
+            (None, vec![0], [0, 0], None),
+            (None, vec![1], [0, 0], None),
+            (None, vec![2], [1, 1], Some(1.0)),
+            (None, vec![7, 2], [7, 7], Some(1.0)),
+            (Some("1,1"), vec![1], [0, 0], None),
+            (Some("1,1"), vec![4], [1, 1], Some(3.0)),
+            (Some("1,1"), vec![7], [2, 2], Some(3.0)),
+            (Some("1,1"), vec![8], [2, 3], Some(3.0)),
+            (Some("1,0"), vec![7], [3, 3], Some(2.0)),
+            (Some("0,0"), vec![7], [6, 6], Some(1.0)),
+        ] {
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            let requests = lengths
+                .iter()
+                .enumerate()
+                .map(|(index, &length)| {
+                    request(&format!("request-{index}"), index as f64 * 5.0, 4, length)
+                })
+                .collect();
+            let mut spec = aggregated_spec(backend, 1, 0.0, requests);
+            spec.max_sim_time_ms = Some(1_000.0);
+            if let Some(rates) = rates {
+                let mut engine: ReplayEngineConfig =
+                    serde_json::from_value(spec.engine.clone()).unwrap();
+                engine.rank.aic_nextn = Some(2);
+                engine.rank.aic_nextn_accept_rates = Some(rates.into());
+                spec.engine = serde_json::to_value(engine).unwrap();
+            }
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .with_telemetry_observer(
+                    1_000.0,
+                    Box::new(RecordingTelemetryObserver {
+                        samples: Arc::clone(&samples),
+                    }),
+                )
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, lengths.len());
+            let tokens = lengths.iter().sum::<usize>();
+            assert_eq!(report.request_counts.total_output_tokens, tokens);
+            let samples = samples.lock().unwrap();
+            let traffic = &samples.last().unwrap().traffic;
+            let expected_forwards = forwards[usize::from(backend == Backend::Sglang)];
+            assert_eq!(
+                traffic.accept_length_forward_count, expected_forwards,
+                "{backend:?}, {lengths:?}"
+            );
+            assert_eq!(
+                traffic.avg_accept_length, expected_average,
+                "{backend:?}, {lengths:?}, {rates:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn replay_accept_length_survives_rank_aggregation_and_prefill_handoffs() {
+    for backend in [Backend::Vllm, Backend::Sglang] {
+        for (dp_size, disaggregated) in [(1, false), (2, false), (2, true)] {
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            let mut requests = vec![request("a", 0.0, 4, 4), request("b", 5.0, 4, 4)];
+            for (index, request) in requests.iter_mut().enumerate() {
+                request.dp_rank = Some(index as u32 % dp_size);
+            }
+            let mut spec = aggregated_spec(backend, 1, 0.0, requests);
+            spec.max_sim_time_ms = Some(1_000.0);
+            let mut engine: ReplayEngineConfig =
+                serde_json::from_value(spec.engine.clone()).unwrap();
+            engine.dp_size = dp_size;
+            engine.rank.aic_nextn = Some(2);
+            engine.rank.aic_nextn_accept_rates = Some("1,1".into());
+            spec.engine = serde_json::to_value(engine).unwrap();
+            if disaggregated {
+                spec.topology = ReplayTopology::Disaggregated {
+                    prefill: WorkerPoolSpec {
+                        initial_workers: 1,
+                        startup_delay_ms: 0.0,
+                    },
+                    decode: WorkerPoolSpec {
+                        initial_workers: 1,
+                        startup_delay_ms: 0.0,
+                    },
+                    handoff_latency_ms: 1.0,
+                };
+            }
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .with_telemetry_observer(
+                    5.0,
+                    Box::new(RecordingTelemetryObserver {
+                        samples: Arc::clone(&samples),
+                    }),
+                )
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 2);
+            assert_eq!(report.request_counts.total_output_tokens, 8);
+            let samples = samples.lock().unwrap();
+            let mut forwards = 0;
+            for sample in samples.iter() {
+                let traffic = &sample.traffic;
+                assert_eq!(
+                    traffic.avg_accept_length,
+                    (traffic.accept_length_forward_count > 0).then_some(3.0),
+                    "{backend:?}, dp={dp_size}, pd={disaggregated}"
+                );
+                forwards += traffic.accept_length_forward_count;
+            }
+            // P/D uses the source output as a handoff signal; all four visible
+            // tokens are produced at decode. Aggregated prefill produces output.
+            assert_eq!(
+                forwards,
+                if disaggregated { 4 } else { 2 },
+                "{backend:?}, dp={dp_size}, pd={disaggregated}"
+            );
+        }
+    }
+}
+
+#[test]
+fn replay_accept_length_ignores_overlapping_prefill_and_rejection() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut spec = aggregated_spec(
+        Backend::Vllm,
+        1,
+        0.0,
+        vec![
+            request("decoding", 0.0, 4, 7),
+            request("prefill-only", 5.0, 4, 1),
+            request("rejected", 5.0, 65, 1),
+        ],
+    );
+    spec.max_sim_time_ms = Some(1_000.0);
+    let mut engine: ReplayEngineConfig = serde_json::from_value(spec.engine.clone()).unwrap();
+    engine.rank.max_model_len = Some(64);
+    engine.rank.aic_nextn = Some(2);
+    engine.rank.aic_nextn_accept_rates = Some("1,1".into());
+    spec.engine = serde_json::to_value(engine).unwrap();
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .with_telemetry_observer(
+            1_000.0,
+            Box::new(RecordingTelemetryObserver {
+                samples: Arc::clone(&samples),
+            }),
+        )
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    assert_eq!(report.request_counts.total_output_tokens, 8);
+    assert_eq!(
+        report
+            .per_request
+            .iter()
+            .filter(|request| request.terminal_status
+                == aisimulate_core::replay::ReplayTerminalStatus::Rejected)
+            .count(),
+        1
+    );
+    let samples = samples.lock().unwrap();
+    let traffic = &samples.last().unwrap().traffic;
+    assert_eq!(traffic.accept_length_forward_count, 2);
+    assert_eq!(traffic.avg_accept_length, Some(3.0));
+}
+
+#[test]
 fn telemetry_baseline_preserves_t0_activity_and_emits_a_positive_final_tail() {
     let samples = Arc::new(Mutex::new(Vec::new()));
     let observer = RecordingTelemetryObserver {
         samples: Arc::clone(&samples),
     };
-    let spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![request("telemetry", 0.0, 4, 2)]);
+    let spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![request("telemetry", 0.0, 4, 3)]);
 
     let report = Replayer::new(spec, ReplayEngineFactory::new())
         .unwrap()
@@ -763,6 +936,8 @@ struct ReleaseOnTopologyCallbacks {
     pending: VecDeque<Uuid>,
     stable_scheduler_id: usize,
     released_on_settled: bool,
+    ready_workers: Vec<usize>,
+    place_immediately: bool,
 }
 
 impl ReleaseOnTopologyCallbacks {
@@ -772,6 +947,8 @@ impl ReleaseOnTopologyCallbacks {
             pending: VecDeque::new(),
             stable_scheduler_id,
             released_on_settled: false,
+            ready_workers: topology.iter().map(|worker| worker.worker_id).collect(),
+            place_immediately: false,
         }
     }
 
@@ -804,6 +981,14 @@ impl PlacementPolicy<ReplayRequestPayload> for ReleaseOnTopologyCallbacks {
     ) -> anyhow::Result<PlacementEffects> {
         self.pending
             .push_back(request.metadata().uuid.expect("test request UUID"));
+        if self.place_immediately {
+            return Ok(PlacementEffects {
+                decision: aisimulate_core::replay::PlacementDecision::Immediate(
+                    self.release_next(self.stable_scheduler_id).pop().unwrap(),
+                ),
+                released: Vec::new(),
+            });
+        }
         Ok(PlacementEffects {
             decision: aisimulate_core::replay::PlacementDecision::Queued,
             released: Vec::new(),
@@ -845,6 +1030,7 @@ impl PlacementPolicy<ReplayRequestPayload> for ReleaseOnTopologyCallbacks {
         worker: WorkerTopology,
         _now_ms: f64,
     ) -> anyhow::Result<Vec<Placement>> {
+        self.ready_workers.push(worker.worker_id);
         Ok(self.release_next(worker.scheduler_ids[0]))
     }
 
@@ -858,9 +1044,15 @@ impl PlacementPolicy<ReplayRequestPayload> for ReleaseOnTopologyCallbacks {
 
     fn worker_removed(
         &mut self,
-        _worker: WorkerTopology,
+        worker: WorkerTopology,
         _now_ms: f64,
     ) -> anyhow::Result<Vec<Placement>> {
+        let index = self
+            .ready_workers
+            .iter()
+            .position(|id| *id == worker.worker_id)
+            .expect("only registered workers receive removal callbacks");
+        self.ready_workers.swap_remove(index);
         Ok(self.release_next(self.stable_scheduler_id))
     }
 
@@ -881,7 +1073,7 @@ impl ReplayComposition for TopologyReleaseComposition {
     type Metadata = NoReplayMetadata;
     type Observation = NoEngineEvents;
     type AggregatedPlacement = ReleaseOnTopologyCallbacks;
-    type DisaggregatedPlacement = PoolRoundRobinPlacement<()>;
+    type DisaggregatedPlacement = ReleaseOnTopologyCallbacks;
 
     fn create_aggregated_placement(
         &mut self,
@@ -899,8 +1091,14 @@ impl ReplayComposition for TopologyReleaseComposition {
         decode_topology: Vec<WorkerTopology>,
     ) -> anyhow::Result<(Self::DisaggregatedPlacement, Self::DisaggregatedPlacement)> {
         Ok((
-            PoolRoundRobinPlacement::new(prefill_topology),
-            PoolRoundRobinPlacement::new(decode_topology),
+            ReleaseOnTopologyCallbacks {
+                place_immediately: true,
+                ..ReleaseOnTopologyCallbacks::new(prefill_topology)
+            },
+            ReleaseOnTopologyCallbacks {
+                place_immediately: true,
+                ..ReleaseOnTopologyCallbacks::new(decode_topology)
+            },
         ))
     }
 
@@ -911,6 +1109,8 @@ impl ReplayComposition for TopologyReleaseComposition {
 
 struct AddThenRemoveWorker {
     step: usize,
+    removal_at_ms: f64,
+    scale_prefill: bool,
 }
 
 impl ReplayScalingPolicy for AddThenRemoveWorker {
@@ -924,11 +1124,13 @@ impl ReplayScalingPolicy for AddThenRemoveWorker {
     ) -> anyhow::Result<ReplayScalingDecision> {
         let decision = match self.step {
             0 => ReplayScalingDecision {
+                target_prefill: self.scale_prefill.then_some(2),
                 target_decode: Some(2),
-                next_tick_ms: Some(1.0),
+                next_tick_ms: Some(self.removal_at_ms),
                 ..ReplayScalingDecision::default()
             },
             1 => ReplayScalingDecision {
+                target_prefill: self.scale_prefill.then_some(1),
                 target_decode: Some(1),
                 ..ReplayScalingDecision::default()
             },
@@ -1040,8 +1242,8 @@ fn scaling_honors_startup_delay_then_scales_the_ready_worker_back_down() {
         ]
     );
     assert_eq!(report.request_counts.completed_requests, 1);
-    assert_eq!(report.throughput.duration_ms, 3_000.0);
-    assert!((report.throughput.decode_worker_seconds - 3.2).abs() < 1e-9);
+    assert_eq!(report.throughput.duration_ms, 2_000.0);
+    assert!((report.throughput.decode_worker_seconds - 2.2).abs() < 1e-9);
 }
 
 #[test]
@@ -1059,7 +1261,11 @@ fn aggregated_topology_callbacks_dispatch_and_record_every_released_request() {
         spec,
         ReplayEngineFactory::new(),
         TopologyReleaseComposition {
-            scaling: Some(Box::new(AddThenRemoveWorker { step: 0 })),
+            scaling: Some(Box::new(AddThenRemoveWorker {
+                step: 0,
+                removal_at_ms: 1.0,
+                scale_prefill: false,
+            })),
         },
     )
     .unwrap()
@@ -1098,4 +1304,110 @@ fn aggregated_topology_callbacks_dispatch_and_record_every_released_request() {
             ("drain_settlement", vec![Uuid::from_u128(4).to_string()],),
         ]
     );
+}
+
+#[test]
+fn canceled_startup_is_captured_without_unregistering_an_unready_worker() {
+    for disaggregated in [false, true] {
+        let mut spec = aggregated_spec(
+            Backend::Vllm,
+            1,
+            100.0,
+            vec![request("long-running", 0.0, 4, 2)],
+        );
+        let mut engine: ReplayEngineConfig = serde_json::from_value(spec.engine.clone()).unwrap();
+        engine.rank.timing_model = TimingModelConfig::Fixed {
+            prefill_ms: 150.0,
+            decode_ms: 50.0,
+        };
+        spec.engine = serde_json::to_value(engine).unwrap();
+        if disaggregated {
+            spec.topology = ReplayTopology::Disaggregated {
+                prefill: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 100.0,
+                },
+                decode: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 100.0,
+                },
+                handoff_latency_ms: 0.0,
+            };
+        }
+        spec.adapters.scaling = ProviderSpec {
+            provider: "topology_callback_test".to_string(),
+            config: serde_json::Value::Null,
+        };
+        let report = Replayer::with_composition(
+            spec,
+            ReplayEngineFactory::new(),
+            TopologyReleaseComposition {
+                scaling: Some(Box::new(AddThenRemoveWorker {
+                    step: 0,
+                    removal_at_ms: 50.0,
+                    scale_prefill: disaggregated,
+                })),
+            },
+        )
+        .unwrap()
+        .with_capture_options(ReplayCaptureOptions {
+            capture_lifecycle_evidence: true,
+            ..ReplayCaptureOptions::default()
+        })
+        .run()
+        .unwrap();
+
+        assert_eq!(report.request_counts.completed_requests, 1);
+        let expected_duration_ms = if disaggregated { 250.0 } else { 200.0 };
+        assert_eq!(report.throughput.duration_ms, expected_duration_ms);
+        let operations = &report.runtime_evidence.lifecycle_operations;
+        let pools = if disaggregated {
+            vec![WorkerPool::Prefill, WorkerPool::Decode]
+        } else {
+            vec![WorkerPool::Agg]
+        };
+        assert_eq!(operations.len(), 2 * pools.len());
+        for pool in pools {
+            let pool_operations = operations
+                .iter()
+                .filter(|operation| operation.pool == pool)
+                .collect::<Vec<_>>();
+            assert_eq!(pool_operations.len(), 2);
+            let start = pool_operations[0];
+            assert_eq!(start.at_ms, 0.0);
+            assert_eq!(start.transitions.len(), 1);
+            assert_eq!(start.transitions[0].worker_id, 1);
+            assert_eq!(
+                start.transitions[0].transition,
+                WorkerLifecycleTransitionKind::WorkerStarting
+            );
+            let cancellation = pool_operations[1];
+            assert_eq!(cancellation.at_ms, 50.0);
+            assert_eq!(cancellation.transitions.len(), 1);
+            let removal = &cancellation.transitions[0];
+            assert_eq!(removal.worker_id, 1);
+            assert_eq!(
+                removal.transition,
+                WorkerLifecycleTransitionKind::WorkerRemoved
+            );
+            assert_eq!(removal.prior_state, Some("starting"));
+            assert_eq!(removal.reason, Some("startup_cancelled"));
+            assert_eq!(
+                removal.origin_operation_ordinal,
+                Some(start.operation_ordinal)
+            );
+            assert_eq!(cancellation.state_after_batch.active, vec![0]);
+            assert!(cancellation.state_after_batch.starting.is_empty());
+            assert!(cancellation.state_after_batch.draining.is_empty());
+            // The stale ready event at 100 ms must neither resurrect the canceled
+            // worker nor extend its provisioned interval in independently captured cost.
+            let captured_worker_seconds =
+                (report.throughput.duration_ms + cancellation.at_ms - start.at_ms) / 1_000.0;
+            let native_worker_seconds = match pool {
+                WorkerPool::Prefill => report.throughput.prefill_worker_seconds,
+                WorkerPool::Agg | WorkerPool::Decode => report.throughput.decode_worker_seconds,
+            };
+            assert!((native_worker_seconds - captured_worker_seconds).abs() < 1e-9);
+        }
+    }
 }

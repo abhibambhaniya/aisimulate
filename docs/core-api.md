@@ -3,16 +3,15 @@
 The core API is delivered through the repository's two release artifacts at
 the same version:
 
-- the `aisimulate` Python wheel, imported as `aisimulate_core` or through the
-  compatibility namespace `aiconfigurator_core`;
+- the `aisimulate` Python wheel, whose estimator API is `aisimulate_core`;
 - the `aisimulate-core` Rust crate, imported as `aisimulate_core`.
 
 The single wheel owns the application, estimator SDK, model and system data,
 and unified native PyO3 extension. It does not depend on another core
 distribution or on Dynamo. The crate owns the compiled engine, forward-pass
 model, Replay runtime, KV-cache request/response types, and the embedded
-Rust-to-Python construction path. The legacy `aiconfigurator_core` Python
-namespace remains available in AISimulate 0.13.0 for compatibility.
+Rust-to-Python construction path. Legacy Python import namespaces are removed
+in AISimulate 0.13.0; see the [Python migration guide](python-source-migration.md).
 
 ## Stable Python facade
 
@@ -75,10 +74,40 @@ engine-spec formats.
 Results are `list[tuple[str, float, float, str]]`, containing
 `(name, latency_ms, energy_wms, source)` with repeated operation names folded
 together. Energy is in watt-milliseconds and is zero when power data is
-unavailable. An empty operation list returns an empty list. Both
-`aisimulate_core.AicEngine` and `aiconfigurator_core.AicEngine` expose this
+unavailable. An empty operation list returns an empty list. `aisimulate_core.AicEngine` exposes this
 method; `EngineHandle` provides an annotated SDK wrapper with the same query
 options.
+
+## Engine context limits
+
+`EngineConfig.max_model_len` is an optional positive prompt-plus-output token
+limit for vLLM, TRT-LLM, and SGLang. Recipe adapters can map TRT-LLM
+`max_seq_len` and SGLang `context_length` to this field.
+
+- A prompt at or above the limit is rejected before prefill computation.
+- A decode destination rejects such a prompt before queuing the handoff or
+  reserving KV blocks, even when destination admission is deferred.
+- Terminal rejection removes the request's outstanding Belady input demand
+  before subsequent cache admission and eviction.
+- Generation stops when prompt plus output reaches the limit, including
+  speculative bursts and requests with explicit output token IDs. Reports
+  retain the requested output length and count only tokens actually generated.
+- TRT-LLM completion reservations and SGLang output reservations use the capped
+  output budget. Physical KV capacity remains a separate constraint.
+- The limit applies to aggregated workers and both roles in disaggregated replay.
+  An unset limit preserves the existing backend behavior.
+
+The prediction compiler and recommendation deployment builder pass explicit
+`engine.context_length` values to every backend. Prediction with
+`context_length: max` retains its existing behavior: vLLM resolves model
+metadata, while TRT-LLM and SGLang leave the scheduler limit unset.
+
+This is the simulator's normalized context-limit contract. It does not model
+backend-version-specific frontend validation margins or automatic prompt
+truncation. Successful replay alone does not establish silicon timing accuracy.
+See the [SGLang GPU parity observations](https://github.com/ai-dynamo/aisimulate/pull/261#pullrequestreview-5250881045)
+for stricter boundary behavior; they do not establish a fixed token offset
+across versions or configurations.
 
 ## KV-cache capacity reservation
 
@@ -153,6 +182,52 @@ config = ForwardPassPerfModelConfig(
 model = RustForwardPassPerfModel.best_available(config)
 print(model.diagnostics()["provenance"])
 ```
+
+### External whole-forward FPM data
+
+Set `estimator_config.fpm_interpolation.fpm_parquet_path` on the canonical configuration to use an external parquet and its required same-stem `.metadata.json` sidecar:
+
+```python
+config = ForwardPassPerfModelConfig(
+    model="Qwen/Qwen3-0.6B",
+    system="h200_sxm",
+    backend="vllm",
+    backend_version="0.25.1",
+    worker_type="aggregated",
+    estimation_mode="fpm_interpolation",
+    estimator_config={
+        "fpm_interpolation": {"fpm_parquet_path": "/data/reviewed-fpm.parquet"},
+    },
+)
+model = RustForwardPassPerfModel.best_available(config)
+```
+
+The parquet identity must match the requested model, hardware, backend version, topology, and quantization. The systems YAML is still required, but a backend timing-data directory is unnecessary. Relative paths bind to the working directory when the model is constructed; resolved provenance stores the absolute path. The control applies when FPM interpolation is selected; other estimators retain it in provenance without opening the file. Saved legacy `timing.forward_model: fpm` and `timing.fpm_parquet_path` inputs migrate to the same canonical control, which is preserved in replay and per-role recommendation output.
+
+`model.static_phase_latency(batch_size=1, input_tokens=512, output_tokens=4, prefill=False)` exposes the native engine's existing static integration before online correction. Prefill returns one prefill latency; decode returns total decode latency for the output sequence. This method requires a native estimator. AFD+PD uses it for an external-FPM regular companion, dividing total decode latency by `max(1, output_tokens - 1)` for TPOT. AFD attention and FFN workers retain their existing timing provider.
+
+### Engine identity controls
+
+The canonical configuration also carries quantization overrides and `attention_backend`, `moe_backend`, `moe_kernel_source` (default absent), `enable_eplb` (default `false`), and `wideep_num_slots` (default absent). These controls reach model construction, KV memory sizing, and replay provenance. EPLB/slots and nondefault MoE backend or kernel-source selection require an MoE model. Collected FPM interpolation cannot represent EPLB, slots, MoE backend, or kernel-source overrides; it rejects an explicit incompatible request and is skipped during automatic selection for those identities.
+
+`moe_kernel_source` selects an exact, nonblank collected `kernel_source` label for fused MoE compute. It is distinct from the existing `moe_backend` graph/backend control; source labels are not backend aliases and are preserved without trimming. `None` keeps the existing default source-selection policy, including eligible low-latency NVFP4 selection. `SILICON` reads only the requested source's table; `EMPIRICAL` derives its estimate from that same source; `HYBRID` may fall back to empirical estimation within that source, but does not substitute a different source. Missing source data remains an error. An explicit `moe_torch_flow_min_latency` requires gated NVFP4 and at most 128 tokens after attention-DP gathering. Pure-roofline `SOL` remains table-independent and does not claim measured support for the requested source.
+
+An explicit source is rejected for dense graphs, MegaMoE modules, large-EP expert-compute graphs, and any constructed timing phase with no compatible fused MoE operator. It is also incompatible with whole-forward FPM, including the legacy Task `forward_model='fpm'` rewrite. Invalid graph/source combinations fail as invalid configuration rather than triggering estimator fallback. An untrained `fpm_regression` model remains not-ready; retaining a source in its configuration is not evidence of source-specific prediction support.
+
+AFD regular companions currently reject exact-source requests through their legacy estimator and fixed timing paths. The external-FPM companion forwards the source to canonical validation, which rejects the incompatible FPM request. These controls describe standalone AISimulate behavior, not downstream Dynamo planner integration.
+
+Rust callers using exhaustive `ForwardPassPerfModelConfig` literals must add `moe_backend: None`, `moe_kernel_source: None`, `enable_eplb: false`, and `wideep_num_slots: None`. Direct `EngineConfig` and `MoeOp` literals likewise require the new `moe_kernel_source` field. `ForwardPassPerfModelConfig::new(...)` supplies its default. This extends the canonical configuration introduced by #242.
+
+Rust callers constructing `SyntheticTraceSpec` must also add
+`cached_prefix_tokens: 0` to preserve existing prefix-sharing behavior. A positive
+value creates shared input tokens; cache hits still depend on runtime state.
+The value must align to the trace's `block_size` and must not exceed any sampled
+input length. Unified replay uses one-token trace blocks for an exact prefix,
+then applies the engine's cache block size when calculating reuse.
+
+`nextn` remains compute-side identity. Expected accepted draft tokens are a
+simulator workload assumption, supplied separately by the unified CLI as
+`engine.nextn_accepted`; they do not tune the estimator.
 
 ### Selection and fallback
 
@@ -364,6 +439,24 @@ missing-data sentinel, not evidence of a zero-power operation. See the
 aggregation rules, and public output boundary. Typed per-op energy alone does
 not make unified replay power available.
 
+## Static phase diagnostics
+
+The canonical `ForwardPassPerfModel` returned by `best_available` exposes
+`static_phase_diagnostics(batch_size, context_length, prefix, prefill)` in Rust; the Python
+`RustForwardPassPerfModel` wrapper accepts the same named arguments (with `prefix=0`).
+It returns name-folded operation latency/energy, source tags, executed MoE communication
+measurement substitutions, and optional SOL latency/compute/memory evidence. Decode means one
+step at `context_length + 1`; prefill removes the cached prefix. Values precede learned online
+correction. Whole-model estimators reject operation decomposition; missing SOL implementations
+carry explicit reasons without changing the selected latency estimate.
+
+Replay requests this evidence through `ReplayOutputRequirements(capture_performance_diagnostics=True)`.
+`TimingOperationEvidence.details` is optional; providers without it must retain `None` (Rust
+struct literals must initialize the new field). The constructor keeps it absent by default.
+The CLI's time/source reports sum the observed phase work, including repeated cached timing
+queries, and preserve distinct fallback records while folding repeated operation names.
+Identical substitutions are deduplicated, so record counts are not execution counts.
+
 ## Replay timing evidence
 
 The runtime-neutral `TimingModel` contract exposes optional accumulated
@@ -388,6 +481,21 @@ that distinction when producing power metrics: absence of evidence is not a
 zero-watt prediction. FPM decode timing continues to query the exact total
 past-KV coordinate rather than the op-level mean-context coordinate.
 
+## Agentic report source migration (0.13)
+
+The replay report additions require the coordinated 0.13.0 wheel/crate version,
+aligned with main's release preparation in PR #268. They must not be released
+as a 0.12 patch. Downstream exhaustive Rust `ReplayReport` literals must supply
+`agentic_phases: None` for a cold run (or its prepared phase evidence).
+Exhaustive `PerRequestRecord` literals must supply `agentic_phase: None` for
+cold replay, or `Some(AgenticReplayPhase::Profile)` for measured warmed requests.
+Exhaustive destructuring must name these fields or use `..`.
+
+The external-consumer compile fixture `rebuild_replay_report_literals` constructs
+both public structs exhaustively against this boundary. JSON consumers retain
+the existing cold shape: absent optional phase evidence is not serialized.
+This source migration does not change the engine-config/spec or FPM wire schemas.
+
 ## Compatibility rules
 
 - The `aisimulate` wheel and `aisimulate-core` crate versions must match for
@@ -402,18 +510,14 @@ past-KV coordinate rather than the op-level mean-context coordinate.
   role/options signatures and separate estimator constructors. This is a source
   migration: use `ForwardPassPerfModelConfig::new(...)` in Rust or the SDK config
   class in Python, and use the explicit migration helper for saved EngineConfig
-  values. Downstream Dynamo callers must migrate before this API is released;
+  values. Downstream Dynamo callers must migrate before this API's stable release;
   keep the crate and wheel versions aligned at the coordinated minor release.
-- Publication is blocked by [the release gate](../.github/release-gates.json)
-  until [Dynamo #14065](https://github.com/ai-dynamo/dynamo/pull/14065) is refreshed,
-  merged, and its Planner/wheel smoke validated against this API. Both scheduled
-  nightly CI and approved manual dispatch run `scripts/check_release_migrations.py`
-  before staging and the downstream publish trigger. Manual dispatch may select
-  a main/release commit, but both the workflow revision's policy and the selected
-  commit's migration declarations must pass before publication. The checker runs
-  from the workflow revision; missing or malformed target gates fail closed.
-  Clear the pending entry in a reviewed change only after the migration evidence
-  is available.
+- [The migration checklist](../.github/release-gates.json) and
+  `scripts/check_release_migrations.py` apply before stable publication. Clear the
+  pending entry in a reviewed change after downstream validation and merge.
+  There is currently no standalone stable-publication workflow in this repository;
+  that release process must invoke the checker for both its policy and target
+  declarations (`--target-gates`). Missing or malformed declarations fail closed.
 - The raw PyO3 class and ergonomic SDK wrapper intentionally share the name
   `RustForwardPassPerfModel`; callers should import from `aisimulate_core.sdk`
   unless they specifically need the JSON-oriented native binding.

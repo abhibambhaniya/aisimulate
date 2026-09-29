@@ -25,6 +25,17 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  # Trusted PR copies share a group across push/manual events. Manual source
+  # branches replace their own runs. Unique lifecycle/tag groups preserve
+  # every validation and protected staging run.
+  group: >-
+    full-ci-${{ (startsWith(github.ref, 'refs/heads/pull-request/') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') &&
+       github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/')))
+      && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   verify-target:
     name: Verify Exact Target
@@ -73,22 +84,27 @@ jobs:
             echo "::error::PR comparison base must resolve to a full commit SHA"
             exit 1
           fi
+          printf 'base=%s\n' "${pr_base}" >> "${GITHUB_OUTPUT}"
       - name: Resolve immutable comparison base
         id: comparison-base
         shell: bash
         env:
           BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ steps.pr-target.outputs.base }}
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           comparison_sha=""
-          if [[ "${GITHUB_EVENT_NAME}" == "push" &&
+          if [[ "${GITHUB_REF}" == refs/heads/pull-request/* ]]; then
+            # Compare a stacked PR with its validated target, not later main changes.
+            comparison_sha="${PR_BASE_SHA}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" &&
                 ( "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF}" == refs/heads/release/* ) &&
                 -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             comparison_sha="${BEFORE_SHA}"
           else
-            # PR/manual runs and newly created release branches compare with
+            # Other manual runs and newly created release branches compare with
             # one snapshot of main, shared by the collector and prediction gates.
             comparison_sha="$(gh api -X GET "repos/${REPOSITORY}/commits/main" --jq '.sha')"
           fi
@@ -422,7 +438,7 @@ jobs:
           python -m venv staged-wheel-smoke
           staged-wheel-smoke/bin/python -m pip install --no-deps dist/aisimulate-*.whl
           staged-wheel-smoke/bin/python -c \
-            "import aisimulate, aisimulate_core, aiconfigurator, aiconfigurator_core; \
+            "import aisimulate, aisimulate_core; \
             assert aisimulate_core._build_smoke() > 0"
       - name: Preserve wheel for trusted staging
         if: github.event_name == 'push'
@@ -878,10 +894,11 @@ jobs:
       - run: release-smoke/bin/python -m pip check
       - run: >-
           release-smoke/bin/python -c
-          "import importlib.metadata as metadata;
-          import aisimulate, aisimulate_core, aiconfigurator, aiconfigurator_core;
-          assert aisimulate.__version__ == aisimulate_core.__version__ == '0.13.0';
-          assert metadata.version('aisimulate') == '0.13.0';
+          "import importlib.metadata as metadata; import pathlib, tomllib;
+          expected = tomllib.loads(pathlib.Path('python/aisimulate/pyproject.toml').read_text())['project']['version'];
+          import aisimulate, aisimulate_core;
+          assert aisimulate.__version__ == aisimulate_core.__version__ == expected;
+          assert metadata.version('aisimulate') == expected;
           installed = {dist.metadata['Name'].lower() for dist in metadata.distributions()};
           forbidden = {'aisimulate-core', 'aiconfigurator', 'aiconfigurator-core'};
           assert installed.isdisjoint(forbidden), installed & forbidden"

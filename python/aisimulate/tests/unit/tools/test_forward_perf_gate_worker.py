@@ -16,7 +16,7 @@ from tools.forward_perf_gate import PROTOCOL_VERSION, cases, measurement, worker
 from tools.forward_perf_gate import run as gate_run
 from tools.prediction_regression_gate import grid
 
-from aiconfigurator.sdk.errors import (
+from aisimulate.sdk.errors import (
     EmpiricalNotImplementedError,
     MissingSystemFlopsError,
     PerfDataNotAvailableError,
@@ -81,7 +81,7 @@ def test_workflow_filters_cover_matrix_dependencies() -> None:
     matches_path = runpy.run_path(str(repo_root / "scripts/select_forward_perf.py"))["matches_path"]
     dependencies = set()
     for case in cases.expand_cases():
-        root = "python/aisimulate/src/aiconfigurator_core"
+        root = "python/aisimulate/src/aisimulate_core"
         model_config = f"{root}/model_configs/{case['model_path'].replace('/', '--')}_config.json"
         assert (repo_root / model_config).is_file()
         dependencies.add(model_config)
@@ -89,8 +89,8 @@ def test_workflow_filters_cover_matrix_dependencies() -> None:
     assert all(matches_path(path) for path in dependencies)
     for unrelated in (
         "docs/cli/user-guide.md",
-        "python/aisimulate/src/aiconfigurator_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
-        "python/aisimulate/src/aiconfigurator_core/systems/data/a100_sxm/gemm/vllm/data.parquet",
+        "python/aisimulate/src/aisimulate_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
+        "python/aisimulate/src/aisimulate_core/systems/data/a100_sxm/gemm/vllm/data.parquet",
     ):
         assert not matches_path(unrelated)
 
@@ -105,7 +105,7 @@ def test_request_validation_rejects_protocol_and_case_drift() -> None:
     request = _request()
     assert worker.validate_request(request)[0]["case_id"] == request["case"]["case_id"]
 
-    request["protocol_version"] = 2
+    request["protocol_version"] = 1
     with pytest.raises(ValueError, match="protocol_version"):
         worker.validate_request(request)
 
@@ -277,6 +277,7 @@ def test_case_group_resets_and_builds_once_and_continues_after_case_failure(
     monkeypatch.setattr(worker, "ensure_rust_library_present", lambda: None)
 
     def fake_setup(*args: object, **kwargs: object) -> tuple[float, object, object]:
+        assert kwargs["shared_layer"] is True
         setup_calls.append(None)
         return 1.0, object(), runtime
 
@@ -491,9 +492,11 @@ def test_run_worker_batch_reports_process_failure(monkeypatch: pytest.MonkeyPatc
     assert error == "WORKER_ERROR: exit 7: boom"
 
 
-def test_full_controller_uses_twelve_batch_processes_and_alternates_case_order(
+@pytest.mark.parametrize("missing_sides", [(), ("base",), ("head",), ("base", "head")])
+def test_full_controller_checks_availability_before_paired_rounds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    missing_sides: tuple[str, ...],
 ) -> None:
     selected = cases.expand_cases()[:2]
     executable = tmp_path / "python"
@@ -512,7 +515,8 @@ def test_full_controller_uses_twelve_batch_processes_and_alternates_case_order(
                     "revision": revision,
                     "case_id": case["case_id"],
                     "case_hash": worker.canonical_case_hash(case),
-                    "status": "OK",
+                    "status": "DATA_MISS" if revision in missing_sides else "OK",
+                    "error": {"type": "PRIMING_FAILED", "message": "missing GEMM data"},
                     "cold_us": 100_000.0,
                     "warm": {"call_median_us": 100.0},
                 }
@@ -545,8 +549,17 @@ def test_full_controller_uses_twelve_batch_processes_and_alternates_case_order(
     monkeypatch.setattr(gate_run, "run_worker_batch", fake_batch)
     monkeypatch.setattr(gate_run, "_command_version", lambda command: "test")
 
-    assert gate_run.main() == 0
+    assert gate_run.main() == int(bool(missing_sides))
     raw = json.loads((output_dir / "raw_results.json").read_text())
+    if missing_sides:
+        assert len(calls) == 2
+        assert raw["worker_processes"] == 2
+        summary = (output_dir / "summary.md").read_text().split("<details>", maxsplit=1)[0]
+        assert "**FAIL**" in summary
+        assert selected[0]["case_id"] in summary
+        assert "PRIMING_FAILED missing GEMM data" in summary
+        assert (output_dir / "annotations.txt").read_text()
+        return
     forward = [case["case_id"] for case in selected]
     assert raw["worker_processes"] == 12
     assert len(calls) == 12

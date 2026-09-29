@@ -14,9 +14,11 @@ from unittest.mock import patch
 
 import pytest
 
-import aiconfigurator.sdk.operations as ops
-from aiconfigurator.sdk import common, config, models
-from aiconfigurator.sdk.models import (
+import aisimulate.sdk.operations as ops
+from aisimulate.sdk import common, config, models
+from aisimulate.sdk.config_builders import build_model_config
+from aisimulate.sdk.errors import InvalidEngineConfigurationError
+from aisimulate.sdk.models import (
     LLAMAModel,
     Qwen3VLModel,
     Qwen3VLMoEModel,
@@ -24,8 +26,9 @@ from aiconfigurator.sdk.models import (
     get_model,
     get_model_family,
 )
-from aiconfigurator.sdk.performance_result import PerformanceResult
-from aiconfigurator.sdk.utils import get_model_config_from_model_path
+from aisimulate.sdk.performance_result import PerformanceResult
+from aisimulate.sdk.speculation import SpeculationConfig
+from aisimulate.sdk.utils import get_model_config_from_model_path
 
 pytestmark = pytest.mark.unit
 
@@ -47,6 +50,91 @@ def test_model_config_normalizes_kernel_backend_enums():
 def test_model_config_rejects_unknown_kernel_backend(field, value):
     with pytest.raises(ValueError, match=field):
         config.ModelConfig(**{field: value})
+
+
+def test_build_model_config_preserves_existing_positional_arguments():
+    speculation = SpeculationConfig(kind="mtp", params={"depth": 2})
+    model_config = build_model_config(
+        4,
+        2,
+        2,
+        2,
+        4,
+        "fp8",
+        "fp8",
+        "bfloat16",
+        "fp8",
+        "half",
+        "fpm",
+        False,
+        "fa3",
+        speculation,
+        "megamoe",
+        True,
+        64,
+    )
+
+    assert (model_config.tp_size, model_config.pp_size, model_config.attention_dp_size) == (4, 2, 2)
+    assert (model_config.moe_tp_size, model_config.moe_ep_size) == (2, 4)
+    assert model_config.gemm_quant_mode is common.GEMMQuantMode.fp8
+    assert model_config.kvcache_quant_mode is common.KVCacheQuantMode.fp8
+    assert model_config.fmha_quant_mode is common.FMHAQuantMode.bfloat16
+    assert model_config.moe_quant_mode is common.MoEQuantMode.fp8
+    assert model_config.comm_quant_mode is common.CommQuantMode.half
+    assert model_config.forward_model == "fpm"
+    assert model_config.enable_encoder_dp is False
+    assert model_config.attention_backend is common.AttentionBackend.fa3
+    assert model_config.speculation is speculation
+    assert model_config.moe_backend is common.MoEBackend.megamoe
+    assert model_config.enable_eplb is True
+    assert model_config.wideep_num_slots == 64
+    assert model_config.moe_kernel_source is None
+
+
+@pytest.mark.parametrize("source", [None, "sglang_flashinfer_trtllm_moe", " source_with_spaces "])
+def test_build_model_config_preserves_exact_kernel_source_keyword(source):
+    model_config = build_model_config(4, 1, 1, 4, 1, moe_kernel_source=source)
+
+    assert model_config.moe_kernel_source == source
+
+
+@pytest.mark.parametrize("source", ["", " ", "\t\n", "\u2003", 1, False, []])
+def test_model_config_rejects_invalid_kernel_source(source):
+    with pytest.raises(ValueError, match="moe_kernel_source must be a non-empty string"):
+        config.ModelConfig(moe_kernel_source=source)
+
+
+@pytest.mark.parametrize(
+    ("model_path", "moe_backend", "message"),
+    [
+        ("Qwen/Qwen3-32B", None, "require an MoE model"),
+        ("deepseek-ai/DeepSeek-V4-Pro", "megamoe", "MegaMoE"),
+    ],
+)
+def test_model_graph_rejects_moe_kernel_source_without_a_compatible_operator(model_path, moe_backend, message):
+    model_config = config.ModelConfig(
+        tp_size=1,
+        attention_dp_size=8,
+        moe_tp_size=1,
+        moe_ep_size=8,
+        moe_backend=moe_backend,
+        moe_kernel_source="missing_source",
+    )
+
+    with pytest.raises(InvalidEngineConfigurationError, match=message):
+        get_model(model_path, model_config, "sglang")
+
+
+def test_model_graph_rejects_source_when_layer_override_removes_all_moe_operators():
+    # Kimi-K3 has a dense first layer; its checkpoint metadata still declares MoE.
+    model_path = "moonshotai/Kimi-K3"
+    assert check_is_moe(model_path)
+    model_config = config.ModelConfig(
+        overwrite_num_layers=1, moe_tp_size=1, moe_ep_size=1, moe_kernel_source="missing_source"
+    )
+
+    with pytest.raises(InvalidEngineConfigurationError, match="moe_kernel_source.*no compatible MoE"):
+        get_model(model_path, model_config, "sglang")
 
 
 class TestSupportedModels:
@@ -107,6 +195,7 @@ class TestSupportedModels:
             ("deepseek-ai/DeepSeek-V3", True),
             ("deepseek-ai/DeepSeek-V3.2", True),
             ("deepseek-ai/DeepSeek-V4-Flash", True),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", True),
             ("deepseek-ai/DeepSeek-V4-Pro", True),
             ("sgl-project/DeepSeek-V4-Flash-FP8", True),
             ("sgl-project/DeepSeek-V4-Pro-FP8", True),
@@ -151,7 +240,7 @@ class TestMOEParallelismResolution:
 
     def test_minimax_m3_builds_with_msa_and_moe(self):
         """MiniMax-M3 registers as its own family and wires the MSA attention op + MoE."""
-        from aiconfigurator.sdk.operations.msa import ContextMSAModule
+        from aisimulate.sdk.operations.msa import ContextMSAModule
 
         model_config = config.ModelConfig(tp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1)
         model = get_model("MiniMaxAI/MiniMax-M3", model_config, backend_name="trtllm")
@@ -625,7 +714,7 @@ class TestHFModelSupport:
         source policy — the rebinding the retired Python query body used to
         do per call. Restubbed at the #1357 PR-5 seam
         (``engine._evaluate_single_op``)."""
-        from aiconfigurator_core.sdk import engine as engine_module
+        from aisimulate_core.sdk import engine as engine_module
 
         recorded = {}
 
@@ -669,7 +758,7 @@ class TestHFModelSupport:
         """The Blackwell-only guard moved to the compiled engine
         (operators/dsv4.rs); it must still surface as a ValueError through the
         query shim on a real pre-Blackwell (sm90) database."""
-        from aiconfigurator.sdk.perf_database import get_database
+        from aisimulate.sdk.perf_database import get_database
 
         op = ops.DeepSeekV4MegaMoEModule(
             "test_megamoe",
@@ -952,7 +1041,7 @@ class TestGptOssHybridKVCache:
         """
         from types import SimpleNamespace
 
-        from aiconfigurator.sdk.backends.factory import get_backend
+        from aisimulate.sdk.backends.factory import get_backend
 
         batch_size, isl, osl = 48, 65_536, 400
         seq_len = isl + osl
@@ -1186,8 +1275,8 @@ class TestMOEModelFP8BlockQuantizationValidation:
             ),
         ],
     )
-    @patch("aiconfigurator.sdk.models._get_model_info")
-    @patch("aiconfigurator.sdk.utils._load_model_config_from_model_path")
+    @patch("aisimulate.sdk.models._get_model_info")
+    @patch("aisimulate.sdk.utils._load_model_config_from_model_path")
     def test_fp8_block_quantization_validation(
         self,
         mock_load_config,
@@ -1587,7 +1676,7 @@ class TestDSAAttentionQuantExclusion:
 
     @staticmethod
     def _excluded(raw):
-        from aiconfigurator.sdk.models.deepseek_v32 import (
+        from aisimulate.sdk.models.deepseek_v32 import (
             _dsa_attention_modules_excluded_from_quant,
         )
 
@@ -1804,7 +1893,7 @@ class TestAttentionProjectionExclusions:
 
     @staticmethod
     def _excl(patterns):
-        from aiconfigurator.sdk.models.helpers import attention_projection_exclusions
+        from aisimulate.sdk.models.helpers import attention_projection_exclusions
 
         return attention_projection_exclusions({"quantization_config": {"ignore": patterns}})
 
@@ -1832,7 +1921,7 @@ class TestBundledModelConfigsOffline:
     """Bundled configs must load without network (P2: DefaultHFModels registration)."""
 
     def test_step3p7_fp8_loads_from_bundle(self, monkeypatch):
-        import aiconfigurator.sdk.utils as sdk_utils
+        import aisimulate.sdk.utils as sdk_utils
 
         def _no_network(*a, **k):
             raise AssertionError("network path reached")
@@ -1847,7 +1936,7 @@ class TestBundledModelConfigsOffline:
         sdk_utils._load_model_config_from_model_path.cache_clear()
 
     def test_dsv32_nvfp4_loads_from_bundle(self, monkeypatch):
-        import aiconfigurator.sdk.utils as sdk_utils
+        import aisimulate.sdk.utils as sdk_utils
 
         def _no_network(*a, **k):
             raise AssertionError("network path reached")
@@ -1863,7 +1952,7 @@ class TestBundledModelConfigsOffline:
         """nvidia/MiniMax-M3-NVFP4 end-to-end: bundled MIXED_PRECISION metadata
         resolves gemm=fp8_block (MXFP8 approximation, owner decision 2026-08-09),
         moe=nvfp4 (routed experts), kv=bfloat16 (kv_cache_quant_algo null)."""
-        import aiconfigurator.sdk.utils as sdk_utils
+        import aisimulate.sdk.utils as sdk_utils
 
         def _no_network(*a, **k):
             raise AssertionError("network path reached")
@@ -1890,7 +1979,7 @@ class TestBundledModelConfigsOffline:
         assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
 
     def test_qwen38max_loads_from_bundle_with_gdn_and_moe_fields(self, monkeypatch):
-        import aiconfigurator.sdk.utils as sdk_utils
+        import aisimulate.sdk.utils as sdk_utils
 
         def _no_network(*a, **k):
             raise AssertionError("network path reached")
@@ -1924,7 +2013,7 @@ class TestBundledModelConfigsOffline:
         sdk_utils._load_model_config_from_model_path.cache_clear()
 
     def test_qwen38max_fp8_loads_from_bundle(self, monkeypatch):
-        import aiconfigurator.sdk.utils as sdk_utils
+        import aisimulate.sdk.utils as sdk_utils
 
         def _no_network(*a, **k):
             raise AssertionError("network path reached")
@@ -2009,7 +2098,7 @@ class TestDSV4NVFP4QuantResolution:
         ],
     )
     def test_routing_expert_target_classification(self, target: str, expected: bool):
-        from aiconfigurator_core.sdk.models.helpers import _is_routing_expert_target
+        from aisimulate_core.sdk.models.helpers import _is_routing_expert_target
 
         assert _is_routing_expert_target(target) is expected
 
@@ -2028,8 +2117,8 @@ class TestDSV4NVFP4QuantResolution:
         sidecar MoE mode must win over the native DeepSeek-V4 ``expert_dtype``
         fallback so the SDK key matches the Collector artifact contract.
         """
-        import aiconfigurator.sdk.utils as sdk_utils
-        from aiconfigurator_core.sdk.models.helpers import _get_model_info
+        import aisimulate.sdk.utils as sdk_utils
+        from aisimulate_core.sdk.models.helpers import _get_model_info
 
         def _no_network(*args, **kwargs):
             raise AssertionError("network path reached")

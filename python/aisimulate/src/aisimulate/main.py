@@ -127,6 +127,7 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
                     include_raw_report=not epd,
                     capture_per_request=args.capture_per_request,
                     capture_memory_diagnostics="memory" in args.detail,
+                    capture_performance_diagnostics=bool({"time", "source"}.intersection(args.detail)),
                 ),
             )
         except (KeyboardInterrupt, ResourceLimitError):
@@ -183,6 +184,13 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         if any(not isinstance(record, dict) for record in records):
             raise RuntimeError("per-request records must be JSON mappings")
         write_requests(root, records)
+    phases = report.metadata.get("agentic_phases")
+    if isinstance(phases, dict) and phases.get("phase") == "aborted":
+        sys.stderr.write(
+            f"ERROR: agentic preparation aborted: {phases.get('failure_reason') or 'preparation did not complete'}; "
+            f"saved full report to: {report_path}\n"
+        )
+        return 1
     sys.stdout.write(
         format_prediction_stdout(
             summary,

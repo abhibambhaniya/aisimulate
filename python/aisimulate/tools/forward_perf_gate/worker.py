@@ -30,7 +30,7 @@ from tools.forward_perf_gate.measurement import (
     redirect_output,
 )
 
-from aiconfigurator.sdk.errors import (
+from aisimulate.sdk.errors import (
     EmpiricalNotImplementedError,
     MissingSystemFlopsError,
     PerfDataNotAvailableError,
@@ -256,7 +256,7 @@ def _run_case_group(cases: list[dict], *, warmup: int, iterations: int, revision
             representative,
             suppress_loader_output=True,
             database_mode=cases[0]["database_mode"],
-            shared_layer=False,
+            shared_layer=True,
         )
     except BaseException as exc:
         _reraise_control_flow(exc)

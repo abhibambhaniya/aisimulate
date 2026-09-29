@@ -38,12 +38,17 @@ starting at step 4 after checking its provenance and coverage.
 
 ## What self-collection covers
 
-Self-collection supplies **engine-iteration latency** for the measured configuration
-and covered workload shapes. It cannot provide PP pipeline behavior, request
-scheduling/routing, prefill–decode transfers, or KV-cache capacity/lifecycle
-modeling; these require separate simulator support. The current collection
-workflow requires **PP=1**, and iteration timings alone do not establish TTFT,
-ITL, or end-to-end throughput accuracy.
+FPM onboarding supplies **customized engine step times** for the measured
+configuration and covered workload shapes. AISimulate Replay uses these timings
+with its existing scheduling, routing, prefill–decode transfer, and KV-cache
+models. Special or customized mechanisms that differ from supported Replay
+behavior, such as layer-wise KV transfer or a custom scheduling/overlap policy,
+require corresponding Replay-side changes; collecting new step times alone does
+not implement those mechanisms.
+
+The current collection workflow requires **PP=1**. Validate TTFT, ITL, and
+end-to-end throughput separately against the target serving configuration;
+matching engine step times alone does not establish their accuracy.
 
 ## Current support and architecture readiness
 
@@ -422,7 +427,7 @@ target = systems / "data/gb300/vllm/0.29.0"
 target.mkdir(parents=True)
 (target / "fpm_forward_perf.parquet").write_bytes(parquet)
 (target / "fpm_forward_perf.metadata.json").write_bytes(sidecar)
-packaged = files("aiconfigurator_core") / "systems"
+packaged = files("aisimulate_core") / "systems"
 for name in ("gb300.yaml", "query_versions.yaml", "attention_lane_defaults.yaml"):
     shutil.copyfile(str(packaged / name), systems / name)
 (run / "manifest.json").write_bytes(manifest_bytes)
@@ -620,11 +625,11 @@ export FPM_RUN=/absolute/new/path/m27-h200-tp4
 mkdir -p "$(dirname "$FPM_RUN")"
 mkdir "$FPM_RUN"
 mkdir -p "$FPM_RUN/systems/data"
-cp "$AIS_REPO/python/aisimulate/src/aiconfigurator_core/systems/h200_sxm.yaml" \
+cp "$AIS_REPO/python/aisimulate/src/aisimulate_core/systems/h200_sxm.yaml" \
   "$FPM_RUN/systems/"
-cp "$AIS_REPO/python/aisimulate/src/aiconfigurator_core/systems/query_versions.yaml" \
+cp "$AIS_REPO/python/aisimulate/src/aisimulate_core/systems/query_versions.yaml" \
   "$FPM_RUN/systems/"
-cp "$AIS_REPO/python/aisimulate/src/aiconfigurator_core/systems/attention_lane_defaults.yaml" \
+cp "$AIS_REPO/python/aisimulate/src/aisimulate_core/systems/attention_lane_defaults.yaml" \
   "$FPM_RUN/systems/"
 ```
 

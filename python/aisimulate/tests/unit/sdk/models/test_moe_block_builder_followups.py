@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import pytest
 
-import aiconfigurator_core.sdk.operations as ops
-from aiconfigurator_core.sdk import common, config
-from aiconfigurator_core.sdk.models import get_model
-from aiconfigurator_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
+import aisimulate_core.sdk.operations as ops
+from aisimulate_core.sdk import common, config
+from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
+from aisimulate_core.sdk.models import get_model
+from aisimulate_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
 
 pytestmark = pytest.mark.unit
 
@@ -59,6 +60,11 @@ def _dispatches(op_list):
 
 
 class TestGpusPerNodeGuard:
+    def test_large_ep_rejects_an_explicit_moe_kernel_source(self):
+        cfg = _cfg(moe_comm_backend={"context": "deepep_ht"}, moe_kernel_source="pinned_source")
+        with pytest.raises(InvalidEngineConfigurationError, match="moe_kernel_source.*large-EP"):
+            _build(cfg, gpus_per_node=8)
+
     def test_large_ep_without_gpus_per_node_raises(self):
         cfg = _cfg(moe_comm_backend={"context": "deepep_ht"})
         with pytest.raises(ValueError, match="gpus_per_node"):
@@ -105,7 +111,7 @@ class TestDispatchQuantMode:
     def test_hybrid_dispatches_stay_quant_agnostic_via_the_param(self, monkeypatch):
         """The hybrid family now passes ``dispatch_quant_mode=None`` through its
         builder call instead of resetting the returned ops."""
-        from aiconfigurator_core.sdk.models import hybrid_moe
+        from aisimulate_core.sdk.models import hybrid_moe
 
         calls = []
         original = hybrid_moe.build_moe_block_ops
@@ -127,7 +133,7 @@ class TestHybridRenameLoopSelfDefense:
         """A returned op name that does not start with the phase would be
         silently mangled by the ``len(phase)`` slice; the rename loop must
         assert instead."""
-        from aiconfigurator_core.sdk.models import hybrid_moe
+        from aisimulate_core.sdk.models import hybrid_moe
 
         def bogus_builder(*args, **kwargs):
             return [ops.ElementWise("bogus_marker", 1, 8, 8, 0.8)]

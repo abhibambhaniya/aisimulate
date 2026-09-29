@@ -783,11 +783,11 @@ impl Engine {
     /// ```text
     /// // Pass 1 — combined non-attention work (every budget token is new):
     /// //   run_static(batch=1, isl=ctx+gen*(nextn+1), osl=1,
-    /// //              prefix=(ctx > 0 && prefix > 0)
-    /// //                     ? prefix * max(floor(ctx/isl_new), 1) : 0,
-    /// //              mode=static_ctx)
-    /// //   sum every op EXCEPT "context_attention"; the prefix is KV
-    /// //   context for ops that fold attention into a module
+    /// //              prefix=n*prefix, mode=static_ctx)
+    /// //   for the same weighted request groups n as pass 2 (prefix 0 or
+    /// //   ctx 0: n = 0); sum every op EXCEPT "context_attention". The
+    /// //   prefix is KV context for ops that fold attention into a module;
+    /// //   an op that does not read it keeps one unweighted value
     /// // Pass 2 — context attention at the prefill shape:
     /// //   prefix == 0 or ctx < isl_new:
     /// //     run_static(batch=ceil(ctx/isl_new), isl=isl, osl=1, prefix)
@@ -1004,15 +1004,21 @@ impl Engine {
         // name (DeepSeek/Kimi `context_mla_block`) reads it through `prefix`,
         // while token-major ops (GEMM, MoE, comm, norms) only read the token
         // count. DSA/DSV4/MSA modules are named `context_attention` and get
-        // the prefix in pass 2. The budget holds `floor(ctx / isl_new)`
-        // complete requests, at least the one whose chunk it carries; as in
-        // the legacy query, they are priced as one sequence over their
-        // summed prefixes. With `ctx == isl_new` this is exactly the legacy
-        // `(combined - prefix, prefix)` query, and prefix 0 is unchanged.
-        let prefix1 = if ctx_tokens == 0 || prefix == 0 {
-            0
+        // the prefix in pass 2. The budget is filled exactly as in pass 2
+        // (`context_attention_groups`): `floor(ctx / isl_new)` complete
+        // requests plus a partial request weighing its fill fraction, or the
+        // one request being chunked. As in the legacy query, the requests of
+        // a group are priced as one sequence over their summed prefixes, so a
+        // group of `n` requests reads `n * prefix` cached tokens. With
+        // `ctx == isl_new` this is exactly the legacy `(combined - prefix,
+        // prefix)` query; prefix 0 or no prefill reads none.
+        let kv_groups: Vec<(u32, f64)> = if ctx_tokens == 0 || prefix == 0 {
+            vec![(0, 1.0)]
         } else {
-            prefix.saturating_mul((ctx_tokens / isl_new).max(1))
+            Self::context_attention_groups(ctx_tokens, isl_new, prefix)
+                .into_iter()
+                .map(|(requests, weight)| (prefix.saturating_mul(requests), weight))
+                .collect()
         };
         let mut shared_non_attention = 0.0;
         for op in &self.context_ops {
@@ -1021,17 +1027,35 @@ impl Engine {
             if op.is_context_attention() || op.name().starts_with("draft_") {
                 continue;
             }
-            let result = query_context_op(
-                op,
-                &self.db,
-                1,
-                combined,
-                prefix1,
-                seq_imbalance_correction_scale,
-                None,
-            )?;
-            shared_non_attention += result.latency_ms;
-            on_op(MixedPass::SharedNonAttention, op, result);
+            let query = |kv_prefix: u32| {
+                query_context_op(
+                    op,
+                    &self.db,
+                    1,
+                    combined,
+                    kv_prefix,
+                    seq_imbalance_correction_scale,
+                    None,
+                )
+            };
+            let first = query(kv_groups[0].0)?;
+            if kv_groups.len() == 1 {
+                shared_non_attention += first.latency_ms;
+                on_op(MixedPass::SharedNonAttention, op, first);
+                continue;
+            }
+            let second = query(kv_groups[1].0)?;
+            if second.latency_ms == first.latency_ms && second.energy_wms == first.energy_wms {
+                // Prefix-free op: one unweighted row keeps the value exact.
+                shared_non_attention += first.latency_ms;
+                on_op(MixedPass::SharedNonAttention, op, first);
+                continue;
+            }
+            for (result, &(_, weight)) in [first, second].into_iter().zip(&kv_groups) {
+                let result = result.scaled(weight);
+                shared_non_attention += result.latency_ms;
+                on_op(MixedPass::SharedNonAttention, op, result);
+            }
         }
 
         // ---- Pass 2: context attention at the prefill shape ----
@@ -3307,23 +3331,26 @@ mod tests {
     }
 
     #[test]
-    fn mixed_step_pass_one_reads_the_cached_prefix_of_the_complete_requests() {
+    fn mixed_step_pass_one_reads_the_cached_prefix_of_the_packed_requests() {
         // A module-attention op priced in pass 1 must see the cached prefix
-        // of the floor(ctx/isl_new) complete requests the budget holds (at
-        // least the one being chunked) and nothing when no prefill runs.
-        // isl 1000, prefix 100 -> isl_new 900; decode 7.
+        // of the requests the budget holds, weighted like pass 2: the one
+        // request being chunked, exactly one request, or two complete
+        // requests plus a partial one weighing its fill fraction; and nothing
+        // when no prefill runs. isl 1000, prefix 100 -> isl_new 900; decode 7.
         let engine = build_engine_with_module_attention();
         let (decode, isl, osl, prefix) = (7_u32, 1000_u32, 64_u32, 100_u32);
         for (ctx, kv_prefix) in [
             (300_u32, 100_u32), // one chunk of one request
             (900, 100),         // exactly one request
-            (2250, 200),        // two complete requests plus a partial one
         ] {
             let got = engine
                 .mixed_step_breakdown(ctx, decode, isl, osl, prefix, 1.0, 1.0)
                 .unwrap();
-            let expected = shared_pass_reference(&engine, ctx + decode, kv_prefix);
-            assert_eq!(got[1], expected, "pass 1 ctx={ctx}");
+            assert_eq!(
+                got[1],
+                shared_pass_reference(&engine, ctx + decode, kv_prefix),
+                "pass 1 ctx={ctx}"
+            );
             assert!(
                 got[1] > shared_pass_reference(&engine, ctx + decode, 0),
                 "the module op must read the prefix (ctx={ctx})"
@@ -3331,11 +3358,38 @@ mod tests {
             // Context attention proper is absent from this fixture.
             assert_eq!(got[2], 0.0);
         }
+        // 2250 = 2 * 900 + 450: two complete requests (200 cached tokens)
+        // plus a partial one of fill 450/900 = 1/2 (300 cached tokens).
+        let got = engine
+            .mixed_step_breakdown(2250, decode, isl, osl, prefix, 1.0, 1.0)
+            .unwrap();
+        let two = shared_pass_reference(&engine, 2257, 200);
+        let three = shared_pass_reference(&engine, 2257, 300);
+        let expected = two / 2.0 + three / 2.0;
+        assert!((got[1] - expected).abs() < 1e-12 * expected);
+        assert!(two < got[1] && got[1] < three);
+        // The per-op surface folds both weighted rows of the module op.
+        let (shared, _, _) = engine
+            .mixed_step_breakdown_per_op(2250, decode, isl, osl, prefix, 1.0, 1.0)
+            .unwrap();
+        assert!((shared.iter().map(|r| r.1).sum::<f64>() - got[1]).abs() < 1e-12 * got[1]);
         // No prefill scheduled: the prefix is inert in pass 1 as well.
         let decode_only = engine
             .mixed_step_breakdown(0, decode, isl, osl, prefix, 1.0, 1.0)
             .unwrap();
         assert_eq!(decode_only[1], shared_pass_reference(&engine, decode, 0));
+    }
+
+    #[test]
+    fn mixed_step_pass_one_keeps_prefix_free_ops_exact_for_a_partial_request() {
+        // In the plain fixture no pass-1 op reads the prefix: a non-multiple
+        // budget with a prefix must price pass 1 exactly as one unweighted
+        // query, not as a rounded convex combination of equal values.
+        let engine = build_engine(None);
+        let got = engine
+            .mixed_step_breakdown(2250, 7, 1000, 64, 100, 1.0, 1.0)
+            .unwrap();
+        assert_eq!(got[1], shared_pass_reference(&engine, 2257, 0));
     }
 
     #[test]

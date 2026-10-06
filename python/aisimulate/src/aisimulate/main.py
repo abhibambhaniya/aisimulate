@@ -9,12 +9,13 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
 
 from .afd_artifacts import write_afd_qualification_artifacts
-from .cli_args import _apply_overrides, _CliConfigError, _load_mapping, build_parser
+from .cli_args import _apply_overrides, _CliConfigError, _extract_output_configs, _load_mapping, build_parser
 from .compiler import prediction_to_replay_spec
 from .config.cli import (
     CorePredictionConfig,
@@ -33,11 +34,18 @@ from .output import (
     format_prediction_stdout,
     format_recommendation_stdout,
     prepare_output_directory,
+    write_fpm_coverage,
     write_prediction_report,
     write_recommendation_csv,
     write_recommendation_result,
     write_recommendations,
     write_requests,
+)
+from .output_adapter import (
+    OutputAdapterExecutionError,
+    OutputAdapterResolutionError,
+    resolve_output_adapters,
+    write_output_adapters,
 )
 from .power import normalize_power_summary
 from .resources import (
@@ -48,6 +56,7 @@ from .resources import (
     workload_bounds,
 )
 from .stack import StackResolutionError, resolve_runner_factory
+from .support.cli import run_support_command
 from .sweeper.provider import AdapterReplaySpec
 from .sweeper.replay import ReplayOutputRequirements
 
@@ -130,9 +139,14 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
                     capture_performance_diagnostics=bool({"time", "source"}.intersection(args.detail)),
                 ),
             )
-        except (KeyboardInterrupt, ResourceLimitError):
-            raise
-        except Exception as exc:
+        except BaseException as exc:
+            coverage = getattr(exc, "fpm_query_coverage", None)
+            if isinstance(coverage, str):
+                coverage = json.loads(coverage)
+            if isinstance(coverage, dict):
+                write_fpm_coverage(root, {**coverage, "status": "incomplete", "error": str(exc)})
+            if isinstance(exc, (KeyboardInterrupt, ResourceLimitError)) or not isinstance(exc, Exception):
+                raise
             raise _CliExecutionError(f"{type(exc).__name__}: {exc}") from exc
     finally:
         mark_shutdown()
@@ -148,6 +162,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         # JSON stdout, like prediction.json, must identify the approximation.
         native["summary"]["metric_semantics"] = report.metadata["metric_semantics"]
         native["summary"]["total_gpus"] = report.metadata["total_gpus"]
+    if isinstance(native.get("fpm_query_coverage"), dict):
+        write_fpm_coverage(root, native["fpm_query_coverage"])
     summary = prediction_summary(native)
     summary.update(normalize_power_summary(report.metrics))
     if "summary" in native:
@@ -206,9 +222,32 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     return 0
 
 
+def _scheduler_variant_key(candidate, concrete: dict[str, Any]) -> str | None:
+    """Fold only scheduler-limit variants with identical complete predictions.
+
+    All other inputs and reported metrics must match, not merely the score.
+    The full result ledger retains every evaluated configuration.
+    """
+    if not candidate.metrics:
+        return None
+    normalized = deepcopy(concrete)
+    for worker in normalized.get("engine", {}).get("workers", {}).values():
+        scheduler = worker.get("scheduler", {})
+        scheduler.pop("max_batched_tokens", None)
+        scheduler.pop("max_sequences", None)
+    return json.dumps(
+        [normalized, candidate.score, candidate.objectives, candidate.metrics],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
 def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     from .recommend import run_recommendation
 
+    raw, output_configs = _extract_output_configs(raw, getattr(args, "outputs", []), stack=args.stack)
+    output_adapters = resolve_output_adapters(output_configs)
     core_raw, adapter_raw = split_config_sections(raw, command="recommend")
     config = CoreRecommendationConfig.model_validate(core_raw)
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
@@ -218,10 +257,13 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         stack=args.stack,
         runner_factory=factory,
         providers=adapters,
+        output_configs=output_configs,
         show_progress=args.format == "table",
     )
     selected: list[tuple[str, Any, dict[str, Any]]] = []
     seen_configs: set[str] = set()
+    seen_variants: set[str] = set()
+    folded = 0
     for candidate_id, candidate in zip(
         result.selected_candidate_ids,
         result.selected_candidates,
@@ -248,6 +290,12 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         if config_key in seen_configs:
             continue
         seen_configs.add(config_key)
+        variant_key = _scheduler_variant_key(candidate, concrete)
+        if variant_key is not None:
+            if variant_key in seen_variants:
+                folded += 1
+                continue
+            seen_variants.add(variant_key)
         selected.append((candidate_id, candidate, concrete))
     result = result.with_selected_prediction_configs(
         [(candidate_id, concrete) for candidate_id, _, concrete in selected]
@@ -255,10 +303,24 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     root = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
     result_path = write_recommendation_result(root, result)
     write_recommendation_csv(root, result)
+    if folded:
+        sys.stderr.write(
+            f"Folded {folded} scheduler-limit variant(s) with identical predicted metrics; "
+            "all evaluated candidates remain in recommendation.json and recommendation.csv\n"
+        )
     if not selected:
         sys.stderr.write(f"no feasible candidate found; saved full result to: {result_path}\n")
         return 3 if getattr(result.counts, "resource_limited", 0) else 1
     paths = write_recommendations(root, [config for _, _, config in selected])
+    try:
+        write_output_adapters(
+            output_adapters,
+            output_configs,
+            result=result,
+            output_dir=root,
+        )
+    except OutputAdapterExecutionError as exc:
+        raise _CliExecutionError(str(exc)) from exc
     rows = []
     for index, ((_, candidate, _), path) in enumerate(zip(selected, paths, strict=True), start=1):
         row = {
@@ -299,6 +361,13 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.command == "onboard":
+        try:
+            return run_support_command(args)
+        except (ValidationError, ValueError, OSError) as exc:
+            parser.error(str(exc))
+        except KeyboardInterrupt:
+            return 130
     # Stack resolution deliberately precedes opening the configuration file.
     try:
         factory = resolve_runner_factory(args.stack)
@@ -313,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         _CliConfigError,
         ConfigAdapterResolutionError,
+        OutputAdapterResolutionError,
         ValidationError,
         ValueError,
     ) as exc:

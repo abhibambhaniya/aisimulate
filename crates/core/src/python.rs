@@ -14,12 +14,12 @@ use crate::engine::{
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
     POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
-    ReplayEngineConfig, ReplayEngineFactory, ReplayOperationPowerDiagnostics,
-    ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics, ReplayRoleConfig, ReplayRuntimeInput,
-    ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
+    ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory,
+    ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
+    ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
     loadgen::{
-        AgenticSnapshotOptions, ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec,
-        SyntheticTraceSpec, Trace, ValidatedAgenticGraph, WekaImportOptions,
+        AgenticProfileOptions, AgenticSnapshotOptions, ArrivalSpec, DelaySpec, DynamoRequestTrace,
+        LengthSpec, SyntheticTraceSpec, Trace, ValidatedAgenticGraph, WekaImportOptions,
         WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
         load_agentic_mooncake, load_weka_agentic_graph_with_options,
     },
@@ -43,6 +43,8 @@ enum ExecutionPayload {
         traffic: Option<Box<RuntimeTraffic>>,
         #[serde(default)]
         capture_performance_diagnostics: bool,
+        #[serde(default)]
+        determinism: ReplayDeterminism,
     },
     Legacy(ReplaySpec),
 }
@@ -77,6 +79,8 @@ struct RuntimeTraffic {
     agentic_snapshot: Option<AgenticSnapshotOptions>,
     #[serde(default)]
     agentic_warmup: bool,
+    #[serde(default)]
+    agentic_profile: Option<AgenticProfileOptions>,
     #[serde(default)]
     isl: Option<usize>,
     #[serde(default)]
@@ -135,31 +139,76 @@ fn require_agentic_execution_model(traffic: &RuntimeTraffic) -> Result<&str> {
         .context("agentic execution requires a configured target model")
 }
 
-fn validate_public_agentic_engine(input: &ReplayRuntimeInput, rank: &EngineConfig) -> Result<()> {
+fn validate_public_agentic_engine(
+    input: &ReplayRuntimeInput,
+    spec: &ReplaySpec,
+    engine: &ReplayEngineConfig,
+) -> Result<()> {
     let ReplayRuntimeInput::Workload(driver) = input else {
         return Ok(());
     };
     if !driver.is_agentic() {
         return Ok(());
     }
-    ensure!(
-        matches!(rank.backend, Backend::Vllm | Backend::Sglang),
-        "agentic replay supports only vLLM and SGLang backends"
-    );
-    ensure!(
-        rank.native_host_offload.is_none(),
-        "agentic replay requires HBM-only KV cache; host offload is unsupported"
-    );
-    ensure!(
-        rank.aic_nextn.is_none(),
-        "agentic replay requires speculative decoding disabled"
-    );
+    let roles = match &spec.topology {
+        ReplayTopology::Aggregated { .. } => vec![aggregated_role(engine)],
+        ReplayTopology::Disaggregated { .. } => vec![
+            engine.role(crate::replay::WorkerStage::Prefill),
+            engine.role(crate::replay::WorkerStage::Decode),
+        ],
+    };
+    for role in &roles {
+        ensure!(
+            role.rank.g3_offload.is_none(),
+            "agentic replay does not support G3 offload"
+        );
+        ensure!(
+            matches!(role.rank.backend, Backend::Vllm | Backend::Sglang),
+            "agentic replay supports only vLLM and SGLang backends"
+        );
+        ensure!(
+            role.rank.aic_nextn.is_none(),
+            "agentic replay requires speculative decoding disabled"
+        );
+    }
+    // HBM-only deployments retain their existing worker/DP support. Once any
+    // active role enables G2, qualify the entire deployment, not just that rank.
+    if roles
+        .iter()
+        .any(|role| role.rank.native_host_offload.is_some())
+    {
+        let single_worker_per_role = match &spec.topology {
+            ReplayTopology::Aggregated { workers } => workers.initial_workers == 1,
+            ReplayTopology::Disaggregated {
+                prefill, decode, ..
+            } => prefill.initial_workers == 1 && decode.initial_workers == 1,
+        };
+        ensure!(
+            single_worker_per_role,
+            "agentic host offload requires one aggregated worker or one prefill and one decode worker"
+        );
+        ensure!(
+            spec.adapters.scaling.provider == "none",
+            "agentic host offload requires static worker pools without a scaling policy"
+        );
+        for role in &roles {
+            ensure!(
+                role.rank.backend == Backend::Vllm,
+                "agentic host offload requires backend=vllm on every role"
+            );
+            ensure!(
+                role.dp_size == 1,
+                "agentic host offload requires attention DP=1 on every role"
+            );
+        }
+    }
     Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AicTimingConfig {
+    #[serde(alias = "model_path")]
     model: String,
     backend: String,
     system: String,
@@ -167,14 +216,20 @@ struct AicTimingConfig {
     tp: u32,
     #[serde(default)]
     backend_version: Option<String>,
-    #[serde(default = "one")]
+    #[serde(default = "one", alias = "pp_size")]
     pp: u32,
-    #[serde(default = "one")]
+    #[serde(default = "one", alias = "attention_dp_size")]
     attention_dp: u32,
+    #[serde(default)]
+    dcp: Option<u32>,
     #[serde(default)]
     moe_tp_size: Option<u32>,
     #[serde(default)]
     moe_ep_size: Option<u32>,
+    /// Prefill context parallelism (SGLang attn-cp / vLLM PCP): folds into the
+    /// attention width like attention_dp. `None` means 1.
+    #[serde(default)]
+    cp_size: Option<u32>,
     #[serde(default, alias = "gemm_quant_mode")]
     gemm_dtype: Option<String>,
     #[serde(default, alias = "moe_quant_mode")]
@@ -205,6 +260,13 @@ struct AicTimingConfig {
     systems_path: Option<String>,
     #[serde(default)]
     forward_model: Option<String>,
+    /// Saved pilot input alias; lowered into the canonical op-level controls.
+    #[serde(default)]
+    decode_workload_distribution: Option<String>,
+    #[serde(default)]
+    fpm_profile: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing)]
+    fpm_interpolation: Option<crate::FpmInterpolationMethod>,
     #[serde(default)]
     fpm_parquet_path: Option<String>,
     #[serde(default)]
@@ -216,7 +278,7 @@ struct AicTimingConfig {
     #[serde(default)]
     fallback_policy: ForwardPassFallbackPolicy,
     #[serde(default)]
-    estimator_config: EstimatorConfig,
+    estimator_config: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     database_mode: crate::DatabaseMode,
     #[serde(default)]
@@ -278,20 +340,28 @@ impl AicTimingConfig {
         } else {
             self.systems_paths.clone()
         };
-        let mut estimator_config = self.estimator_config.clone();
         if let Some(path) = &self.fpm_parquet_path {
             crate::config::validate_fpm_parquet_path(
                 Some(std::path::Path::new(path)),
                 mode == EstimationMode::FpmInterpolation,
             )?;
-            let configured = &mut estimator_config.fpm_interpolation.fpm_parquet_path;
+        }
+        let mut estimator_config = EstimatorConfig::migrate_legacy_inputs(
+            Some(&serde_json::to_string(&self.estimator_config)?),
+            None,
+            self.fpm_interpolation.map(|method| method.as_str()),
+            self.fpm_parquet_path.as_deref(),
+        )?;
+        if let Some(selected) = &self.decode_workload_distribution {
             ensure!(
-                configured
+                estimator_config
+                    .op_level
+                    .decode_workload_distribution
                     .as_ref()
-                    .is_none_or(|existing| existing == std::path::Path::new(path)),
-                "conflicting fpm_parquet_path and estimator_config.fpm_interpolation.fpm_parquet_path"
+                    .is_none_or(|value| value == selected),
+                "decode_workload_distribution conflicts with estimator_config.op_level"
             );
-            *configured = Some(path.into());
+            estimator_config.op_level.decode_workload_distribution = Some(selected.clone());
         }
         Ok(ForwardPassPerfModelConfig {
             model: self.model.clone(),
@@ -302,8 +372,10 @@ impl AicTimingConfig {
             tp: self.tp,
             pp: self.pp,
             attention_dp: self.attention_dp,
+            dcp: self.dcp,
             moe_tp_size: self.moe_tp_size,
             moe_ep_size: self.moe_ep_size,
+            cp_size: self.cp_size,
             gemm_quant_mode: self.gemm_dtype.clone(),
             moe_quant_mode: self.moe_dtype.clone(),
             fmha_quant_mode: self.fmha_dtype.clone(),
@@ -317,6 +389,7 @@ impl AicTimingConfig {
             estimation_mode: mode,
             fallback_policy: self.fallback_policy,
             estimator_config,
+            fpm_profile: self.fpm_profile.clone(),
             database_mode: self.database_mode,
             transfer_policy: self.transfer_policy.clone(),
             systems_paths: roots,
@@ -395,9 +468,11 @@ impl AicTimingConfig {
                 && self.pp > 0
                 && self.attention_dp > 0
                 && self.moe_tp_size != Some(0)
-                && self.moe_ep_size != Some(0),
-            "AIC timing parallel sizes tp, pp, attention_dp, moe_tp_size, and \
-             moe_ep_size must be positive"
+                && self.moe_ep_size != Some(0)
+                && self.cp_size != Some(0)
+                && self.dcp != Some(0),
+            "AIC timing parallel sizes tp, pp, attention_dp, moe_tp_size, \
+             moe_ep_size, cp_size, and dcp must be positive"
         );
         ensure!(self.nextn <= 5, "AIC nextn must be in 0..=5");
         self.speculative_depth()?;
@@ -406,10 +481,15 @@ impl AicTimingConfig {
             "AIC moe_tp_size and moe_ep_size must be configured together"
         );
         if let (Some(moe_tp), Some(moe_ep)) = (self.moe_tp_size, self.moe_ep_size) {
+            // Prefill CP widens the attention side (mirrors ModelConfig's
+            // `tp * attention_dp * cp == moe_tp * moe_ep`); decode CP reuses
+            // ranks inside the attention group and is deliberately absent.
+            let cp = u64::from(self.cp_size.unwrap_or(1));
             ensure!(
-                u64::from(self.tp) * u64::from(self.attention_dp)
-                    == u64::from(moe_tp) * u64::from(moe_ep),
-                "AIC topology requires tp * attention_dp == moe_tp_size * moe_ep_size"
+                self.fpm_profile.is_some()
+                    || u64::from(self.tp) * u64::from(self.attention_dp) * cp
+                        == u64::from(moe_tp) * u64::from(moe_ep),
+                "AIC topology requires tp * attention_dp * cp_size == moe_tp_size * moe_ep_size"
             );
         }
         Ok(())
@@ -433,21 +513,44 @@ enum AicPhaseProvider {
 
 struct AicTimingModel {
     engine: Py<PyAny>,
-    diagnostic_model: Option<ForwardPassPerfModel>,
+    diagnostic_model: Option<Arc<ForwardPassPerfModel>>,
+    fpm_model: Option<Arc<ForwardPassPerfModel>>,
     decoder_replay: bool,
     phase_provider: AicPhaseProvider,
     use_fpm_decode_totals: bool,
     fpm_decode_kv_ceiling: Option<u32>,
     evidence: Mutex<TimingEvidenceAccumulator>,
+    // Capture-only history. Keyed by phase and exact iteration totals, so
+    // repeated invocations increment a count without cloning prior history.
+    fpm_evidence:
+        Mutex<std::collections::BTreeMap<(bool, u32, u32, u32), crate::FpmEstimateEvidence>>,
     phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
 }
 
 impl AicTimingModel {
     fn build(config: &mut AicTimingConfig, worker_type: ForwardPassWorkerType) -> Result<Self> {
+        let request = config.estimator_request(worker_type)?;
+        if request
+            .estimator_config
+            .op_level
+            .prefill_graph_profile
+            .is_some()
+            || request
+                .estimator_config
+                .op_level
+                .prefill_graph_profile_id
+                .is_some()
+        {
+            anyhow::bail!(
+                "graph prefill profile supports only direct predict_prefill_latency; replay/scheduler timing is unqualified"
+            );
+        }
         config.validate_parallel_shape()?;
         config.resolved_memory_fraction()?;
-        let model = ForwardPassPerfModel::best_available(config.estimator_request(worker_type)?)
-            .context("AIC timing provider could not construct the requested estimator")?;
+        let model = Arc::new(
+            ForwardPassPerfModel::best_available(request)
+                .context("AIC timing provider could not construct the requested estimator")?,
+        );
         let provenance = model
             .provenance()
             .context("canonical estimator omitted construction provenance")?;
@@ -464,33 +567,40 @@ impl AicTimingModel {
         config.forward_model = None;
         config.fpm_parquet_path = None;
         config.fallback_policy = ForwardPassFallbackPolicy::Deny;
-        config.estimator_config = provenance.config.estimator_config.clone();
+        config.estimator_config =
+            serde_json::from_value(serde_json::to_value(&provenance.config.estimator_config)?)?;
+        config.fpm_profile = provenance.config.fpm_profile.clone();
+        config.fpm_interpolation = None;
+        config.gemm_dtype = provenance.config.gemm_quant_mode.clone();
+        config.moe_dtype = provenance.config.moe_quant_mode.clone();
+        config.fmha_dtype = provenance.config.fmha_quant_mode.clone();
+        config.kv_cache_dtype = provenance.config.kvcache_quant_mode.clone();
+        config.comm_dtype = provenance.config.comm_quant_mode.clone();
+        config.attention_backend = provenance.config.attention_backend.clone();
         let use_fpm_decode_totals =
             provenance.selected_estimation_mode == EstimationMode::FpmInterpolation;
         let native = model.native_engine().context(
             "AIC regression estimator is not ready: offline replay requires trained observations or a native estimator"
         )?;
         let phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
-        let (engine, fpm_decode_kv_ceiling) = Python::with_gil(|py| -> PyResult<_> {
-            let engine = Py::new(py, crate::AicEngine::from_shared_engine(native))?.into_any();
-            let ceiling = if use_fpm_decode_totals {
-                engine
-                    .bind(py)
-                    .call_method0("fpm_decode_kv_ceiling")?
-                    .extract::<Option<u32>>()?
-            } else {
-                None
-            };
-            Ok((engine, ceiling))
+        let engine = Python::with_gil(|py| -> PyResult<_> {
+            Ok(Py::new(py, crate::AicEngine::from_shared_engine(native))?.into_any())
         })?;
+        let fpm_decode_kv_ceiling = if use_fpm_decode_totals {
+            model.fpm_decode_kv_ceiling()?
+        } else {
+            None
+        };
         Ok(Self {
             engine,
+            fpm_model: use_fpm_decode_totals.then(|| Arc::clone(&model)),
             diagnostic_model: Some(model),
             decoder_replay: config.decoder_replay,
             phase_provider,
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling,
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
+            fpm_evidence: Mutex::default(),
             phase_cache: quick_cache::sync::Cache::new(128),
         })
     }
@@ -626,6 +736,32 @@ impl AicTimingModel {
             .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))?;
         evidence.record(phase, prefill)
     }
+
+    fn record_fpm_estimate(
+        &self,
+        key: (bool, u32, u32, u32),
+        estimate: crate::ForwardPassEstimate,
+    ) -> Result<f64> {
+        let latency_ms = estimate
+            .latency_ms
+            .context("native FPM returned no estimate")?;
+        if latency_ms > 0.0 {
+            let mut evidence = self
+                .fpm_evidence
+                .lock()
+                .map_err(|_| anyhow!("FPM evidence accumulator was poisoned"))?;
+            let entry = evidence.entry(key).or_insert(crate::FpmEstimateEvidence {
+                estimate,
+                count: 0,
+                latency_scale: 1.0,
+            });
+            entry.count = entry
+                .count
+                .checked_add(1)
+                .context("FPM evidence invocation count overflow")?;
+        }
+        Ok(latency_ms)
+    }
 }
 
 fn phase_evidence_from_native_entries(
@@ -703,6 +839,17 @@ impl TimingModel for AicTimingModel {
             self.record_evidence(&evidence, true)?;
             return Ok(latency_ms);
         }
+        if let Some(model) = &self.diagnostic_model {
+            return self.record_fpm_estimate(
+                (true, batch_size, mean_isl, mean_prefix),
+                model.static_prefill_detailed(batch_size, mean_isl, mean_prefix)?,
+            );
+        }
+        if let Some(model) = &self.fpm_model {
+            return model
+                .predict_prefill_latency(batch_size, mean_isl, mean_prefix)
+                .context("AIC prefill prediction failed");
+        }
         Python::with_gil(|py| {
             self.engine
                 .bind(py)
@@ -729,6 +876,24 @@ impl TimingModel for AicTimingModel {
                 .min(total_kv_tokens);
             let batch_size = checked_u32(batch_size, "decode batch size")?;
             let total_past_kv_tokens = checked_u32(total_past_kv_tokens, "total past KV tokens")?;
+            if let Some(model) = &self.diagnostic_model {
+                let estimate =
+                    model.estimate_forward_pass_detailed(&[crate::ForwardPassMetrics {
+                        scheduled_requests: crate::ScheduledRequestMetrics {
+                            num_decode_requests: batch_size,
+                            sum_decode_kv_tokens: total_past_kv_tokens,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }])?;
+                return self
+                    .record_fpm_estimate((false, batch_size, 0, total_past_kv_tokens), estimate);
+            }
+            if let Some(model) = &self.fpm_model {
+                return model
+                    .predict_decode_latency_total(batch_size, total_past_kv_tokens)
+                    .context("AIC decode prediction failed");
+            }
             return Python::with_gil(|py| {
                 self.engine
                     .bind(py)
@@ -765,7 +930,52 @@ impl TimingModel for AicTimingModel {
             .map(|evidence| evidence.snapshot())
     }
 
+    fn fpm_evidence_summary(&self) -> Option<TimingEvidenceSummary> {
+        if !self.use_fpm_decode_totals || self.diagnostic_model.is_none() {
+            return None;
+        }
+        let history = self.fpm_evidence.lock().ok()?;
+        let phase = |prefill: bool| {
+            let fpm_estimates: Vec<_> = history
+                .iter()
+                .filter(|(key, _)| key.0 == prefill)
+                .map(|(_, evidence)| evidence.clone())
+                .collect();
+            if fpm_estimates.is_empty() {
+                return TimingPhaseEvidence::default();
+            }
+            let latency_ms = fpm_estimates
+                .iter()
+                .map(|record| record.estimate.latency_ms.unwrap_or(0.0) * record.count as f64)
+                .sum();
+            let mut operation = TimingOperationEvidence::new(
+                if prefill { "fpm_prefill" } else { "fpm_decode" },
+                latency_ms,
+                None,
+                TimingEvidenceSource::Silicon,
+            )
+            .expect("finite native FPM evidence");
+            operation.details = Some(crate::perfmodel::engine::diagnostics::OperationDetails {
+                sol: None,
+                sol_unavailable_reason: Some(
+                    "whole-model FPM does not export an operation SOL decomposition".into(),
+                ),
+                fallbacks: Vec::new(),
+                fpm_estimates,
+            });
+            TimingPhaseEvidence::from_operations(vec![operation])
+        };
+        Some(TimingEvidenceSummary {
+            prefill: phase(true),
+            decode: phase(false),
+        })
+    }
+
     fn reset_evidence(&self) -> Result<()> {
+        self.fpm_evidence
+            .lock()
+            .map_err(|_| anyhow!("FPM evidence accumulator was poisoned"))?
+            .clear();
         *self
             .evidence
             .lock()
@@ -779,38 +989,73 @@ fn checked_u32(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{name} {value} exceeds AIC's u32 limit"))
 }
 
+fn aic_capacity_kwargs<'py>(
+    py: Python<'py>,
+    config: &AicTimingConfig,
+    role: &ReplayRoleConfig,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (memory_fraction_kind, memory_fraction_value) = config
+        .resolved_memory_fraction()
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("backend_version", config.resolved_backend_version())?;
+    kwargs.set_item("scheduler_block_size", role.rank.block_size)?;
+    kwargs.set_item("max_num_tokens", role.rank.max_num_batched_tokens)?;
+    kwargs.set_item("max_batch_size", role.rank.max_num_seqs)?;
+    if config.fpm_profile.is_some() {
+        kwargs.set_item("context_length", role.rank.max_model_len)?;
+        kwargs.set_item(
+            "worker_type",
+            match config
+                .worker_type
+                .unwrap_or(ForwardPassWorkerType::Aggregated)
+            {
+                ForwardPassWorkerType::Prefill => "prefill",
+                ForwardPassWorkerType::Decode => "decode",
+                ForwardPassWorkerType::Aggregated => "aggregated",
+            },
+        )?;
+    }
+    kwargs.set_item("memory_fraction_kind", memory_fraction_kind)?;
+    kwargs.set_item("memory_fraction_value", memory_fraction_value)?;
+    kwargs.set_item("tp_size", config.tp)?;
+    kwargs.set_item("pp_size", config.pp)?;
+    kwargs.set_item("attention_dp_size", config.attention_dp)?;
+    kwargs.set_item("moe_tp_size", config.moe_tp_size)?;
+    kwargs.set_item("moe_ep_size", config.moe_ep_size)?;
+    kwargs.set_item("cp_size", config.cp_size.unwrap_or(1))?;
+    // Capacity estimation prices the 1/dcp KV stripe; unrecorded DCP is 1.
+    kwargs.set_item("dcp_size", config.dcp.unwrap_or(1))?;
+    kwargs.set_item("gemm_quant_mode", config.gemm_dtype.as_deref())?;
+    kwargs.set_item("moe_quant_mode", config.moe_dtype.as_deref())?;
+    kwargs.set_item("fmha_quant_mode", config.fmha_dtype.as_deref())?;
+    kwargs.set_item("kvcache_quant_mode", config.kv_cache_dtype.as_deref())?;
+    kwargs.set_item("comm_quant_mode", config.comm_dtype.as_deref())?;
+    kwargs.set_item("moe_backend", config.moe_backend.as_deref())?;
+    kwargs.set_item("attention_backend", config.attention_backend.as_deref())?;
+    kwargs.set_item("enable_eplb", config.enable_eplb)?;
+    kwargs.set_item("wideep_num_slots", config.wideep_num_slots)?;
+    kwargs.set_item(
+        "fpm_profile",
+        config
+            .fpm_profile
+            .as_ref()
+            .map(|profile| serde_json::to_string(profile).expect("JSON profile")),
+    )?;
+    kwargs.set_item(
+        "cuda_graph_reserved_bytes",
+        config.cuda_graph_reserved_bytes,
+    )?;
+    // Capacity intentionally omits NextN until AIC's Eagle memory model no
+    // longer returns negative KV capacity. Timing compilation still uses it.
+    kwargs.set_item("systems_path", config.systems_path.as_deref())?;
+    Ok(kwargs)
+}
+
 fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig) -> Result<usize> {
-    let (memory_fraction_kind, memory_fraction_value) = config.resolved_memory_fraction()?;
     Python::with_gil(|py| -> PyResult<usize> {
         let memory = PyModule::import(py, "aisimulate_core.sdk.memory")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("backend_version", config.resolved_backend_version())?;
-        kwargs.set_item("scheduler_block_size", role.rank.block_size)?;
-        kwargs.set_item("max_num_tokens", role.rank.max_num_batched_tokens)?;
-        kwargs.set_item("max_batch_size", role.rank.max_num_seqs)?;
-        kwargs.set_item("memory_fraction_kind", memory_fraction_kind)?;
-        kwargs.set_item("memory_fraction_value", memory_fraction_value)?;
-        kwargs.set_item("tp_size", config.tp)?;
-        kwargs.set_item("pp_size", config.pp)?;
-        kwargs.set_item("attention_dp_size", config.attention_dp)?;
-        kwargs.set_item("moe_tp_size", config.moe_tp_size)?;
-        kwargs.set_item("moe_ep_size", config.moe_ep_size)?;
-        kwargs.set_item("gemm_quant_mode", config.gemm_dtype.as_deref())?;
-        kwargs.set_item("moe_quant_mode", config.moe_dtype.as_deref())?;
-        kwargs.set_item("fmha_quant_mode", config.fmha_dtype.as_deref())?;
-        kwargs.set_item("kvcache_quant_mode", config.kv_cache_dtype.as_deref())?;
-        kwargs.set_item("comm_quant_mode", config.comm_dtype.as_deref())?;
-        kwargs.set_item("moe_backend", config.moe_backend.as_deref())?;
-        kwargs.set_item("attention_backend", config.attention_backend.as_deref())?;
-        kwargs.set_item("enable_eplb", config.enable_eplb)?;
-        kwargs.set_item("wideep_num_slots", config.wideep_num_slots)?;
-        kwargs.set_item(
-            "cuda_graph_reserved_bytes",
-            config.cuda_graph_reserved_bytes,
-        )?;
-        // Capacity intentionally omits NextN until AIC's Eagle memory model no
-        // longer returns negative KV capacity. Timing compilation still uses it.
-        kwargs.set_item("systems_path", config.systems_path.as_deref())?;
+        let kwargs = aic_capacity_kwargs(py, config, role)?;
         memory
             .getattr("estimate_num_gpu_blocks")?
             .call(
@@ -824,6 +1069,31 @@ fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig
             .extract()
     })
     .map_err(|error| anyhow!("AIC KV-cache capacity estimation failed: {error}"))
+}
+
+fn estimate_aic_grouped_budget(
+    config: &AicTimingConfig,
+    role: &ReplayRoleConfig,
+) -> Result<crate::perfmodel::fpm::FpmCacheBudget> {
+    let serialized = Python::with_gil(|py| -> PyResult<String> {
+        let memory = PyModule::import(py, "aisimulate_core.sdk.memory")?;
+        let kwargs = aic_capacity_kwargs(py, config, role)?;
+        kwargs.del_item("scheduler_block_size")?;
+        kwargs.set_item("context_length", role.rank.max_model_len)?;
+        let budget = memory.getattr("estimate_kv_cache")?.call(
+            (
+                config.model.as_str(),
+                config.system.as_str(),
+                config.backend.as_str(),
+            ),
+            Some(&kwargs),
+        )?;
+        PyModule::import(py, "json")?
+            .call_method1("dumps", (budget,))?
+            .extract()
+    })
+    .map_err(|error| anyhow!("AIC grouped-cache budget estimation failed: {error}"))?;
+    serde_json::from_str(&serialized).context("invalid AIC grouped-cache budget")
 }
 
 fn materialize_aic_capacity(
@@ -868,6 +1138,54 @@ fn materialize_aic_capacity(
         timing_depth as usize == engine_nextn,
         "AIC speculative depth={timing_depth} does not match engine aic_nextn={engine_nextn}"
     );
+    let resources = if config.backend == "vllm" && config.pp == 1 {
+        config
+            .estimator_request(
+                config
+                    .worker_type
+                    .unwrap_or(ForwardPassWorkerType::Aggregated),
+            )?
+            .fpm_resources()?
+    } else {
+        None
+    };
+    if let Some(resources) = &resources {
+        resources.require_memory()?;
+        ensure!(
+            resources.runtime_memory.is_none() || !capacity_is_explicit,
+            "runtime FPM memory cannot use fixed num_gpu_blocks; use the recorded cache allocation"
+        );
+    }
+    if resources.as_ref().is_some_and(|resources| {
+        resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::Grouped
+    }) {
+        ensure!(
+            !capacity_is_explicit,
+            "grouped FPM cache cannot use fixed num_gpu_blocks; use the profile byte budget"
+        );
+        let budget = estimate_aic_grouped_budget(config, role)?;
+        ensure!(
+            role.rank.kv_cache_groups.is_empty()
+                || role.rank.kv_cache_groups == budget.cache_groups,
+            "engine cache groups conflict with the canonical FPM profile"
+        );
+        ensure!(
+            role.rank
+                .kv_cache_capacity_bytes
+                .is_none_or(|bytes| bytes == budget.total_kv_size_bytes),
+            "engine cache byte capacity conflicts with the canonical FPM resource budget"
+        );
+        role.rank.kv_cache_groups = budget.cache_groups;
+        role.rank.kv_cache_capacity_bytes = Some(budget.total_kv_size_bytes);
+        // Keep the historical positive field for EngineConfig compatibility.
+        // The grouped allocator exclusively consumes groups and byte capacity.
+        role.rank.validate()?;
+        return Ok(());
+    }
+    ensure!(
+        role.rank.kv_cache_groups.is_empty() && role.rank.kv_cache_capacity_bytes.is_none(),
+        "grouped cache allocation requires matching canonical FPM profile resources"
+    );
     if capacity_is_explicit || role.rank.state_cache.is_some() {
         return Ok(());
     }
@@ -880,12 +1198,17 @@ fn materialize_aic_capacity(
 fn cap_role_capacity_to_fpm_decode_domain(
     role: &mut ReplayRoleConfig,
     decode_kv_ceiling: Option<u32>,
-    capacity_is_explicit: bool,
+    capacity_is_recorded: bool,
 ) -> Result<()> {
+    // A timing-table token ceiling is not a physical grouped-cache budget.
+    // Queries retain their logical contexts and report uncovered points normally.
+    if !role.rank.kv_cache_groups.is_empty() {
+        return Ok(());
+    }
     let Some(decode_kv_ceiling) = decode_kv_ceiling else {
         return Ok(());
     };
-    if capacity_is_explicit || role.rank.state_cache.is_some() {
+    if capacity_is_recorded || role.rank.state_cache.is_some() {
         return Ok(());
     }
     let covered_blocks = decode_kv_ceiling as usize / role.rank.block_size;
@@ -927,6 +1250,7 @@ fn resolve_role_timing(
     capacity_is_explicit: bool,
     worker_type: ForwardPassWorkerType,
     capture_performance_diagnostics: bool,
+    coverage_sources: &mut Vec<(ForwardPassWorkerType, Arc<ForwardPassPerfModel>)>,
 ) -> Result<Option<Arc<dyn TimingModel>>> {
     let TimingModelConfig::External { provider, config } = role.rank.timing_model.clone() else {
         return Ok(None);
@@ -938,7 +1262,20 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
+    let resources = if config.backend == "vllm" && config.pp == 1 {
+        config.estimator_request(worker_type)?.fpm_resources()?
+    } else {
+        None
+    };
+    if let Some(resources) = &resources {
+        resources.require_memory()?;
+    }
     let mut timing = AicTimingModel::build(&mut config, worker_type)?;
+    if let Some(model) = &timing.fpm_model
+        && model.fpm_query_coverage()?.is_some()
+    {
+        coverage_sources.push((worker_type, Arc::clone(model)));
+    }
     if !capture_performance_diagnostics {
         timing.diagnostic_model = None;
     }
@@ -951,7 +1288,10 @@ fn resolve_role_timing(
     cap_role_capacity_to_fpm_decode_domain(
         role,
         timing.fpm_decode_kv_ceiling,
-        capacity_is_explicit,
+        capacity_is_explicit
+            || resources
+                .as_ref()
+                .is_some_and(|resources| resources.runtime_memory.is_some()),
     )?;
     let mut resolved = serde_json::to_value(config.estimator_request(worker_type)?)?;
     if let Some(object) = resolved.as_object_mut() {
@@ -1082,16 +1422,36 @@ fn resolve_kv_capacity_concurrency(
         expected_tokens > 0,
         "KV load requires positive token lengths"
     );
-    let per_rank_tokens = role
-        .rank
-        .num_gpu_blocks
-        .checked_mul(role.rank.block_size)
-        .context("KV capacity overflow")?;
-    let total_tokens = per_rank_tokens
-        .checked_mul(role.dp_size as usize)
-        .and_then(|value| value.checked_mul(replicas))
-        .context("aggregate KV capacity overflow")?;
-    let capacity = total_tokens / expected_tokens;
+    let capacity = if !role.rank.kv_cache_groups.is_empty() {
+        let request_bytes = role
+            .rank
+            .kv_cache_groups
+            .iter()
+            .try_fold(0u64, |sum, group| {
+                sum.checked_add(group.peak_request_bytes(expected_tokens as u64, 1)?)
+                    .context("grouped KV request bytes overflow")
+            })?;
+        let per_rank = role
+            .rank
+            .kv_cache_capacity_bytes
+            .context("grouped KV load requires byte capacity")?
+            / request_bytes;
+        usize::try_from(per_rank)?
+            .checked_mul(role.dp_size as usize)
+            .and_then(|value| value.checked_mul(replicas))
+            .context("aggregate grouped KV concurrency overflow")?
+    } else {
+        let per_rank_tokens = role
+            .rank
+            .num_gpu_blocks
+            .checked_mul(role.rank.block_size)
+            .context("KV capacity overflow")?;
+        let total_tokens = per_rank_tokens
+            .checked_mul(role.dp_size as usize)
+            .and_then(|value| value.checked_mul(replicas))
+            .context("aggregate KV capacity overflow")?;
+        total_tokens / expected_tokens
+    };
     ensure!(
         capacity > 0,
         "candidate KV capacity cannot hold one request"
@@ -1113,11 +1473,15 @@ fn build_agentic_driver(
             .context("agentic_snapshot requires positive agentic_lanes")?;
         // Sample recorded time before applying speedup to remaining timers.
         let prepared = graph.prepare_snapshots(lanes, *options)?;
-        if traffic.agentic_warmup {
+        let mut driver = if traffic.agentic_warmup {
             WorkloadDriver::new_agentic_warmup(prepared, engine_block_size, true, speedup)
         } else {
             WorkloadDriver::new_agentic_snapshots(prepared, engine_block_size, true, speedup)
+        }?;
+        if let Some(profile) = &traffic.agentic_profile {
+            driver.enable_agentic_profile(profile.clone())?;
         }
+        Ok(driver)
     } else {
         WorkloadDriver::new_agentic_trace_with_options(
             graph.normalize_starts().speed_up_timing(speedup)?,
@@ -1133,6 +1497,17 @@ fn build_runtime_input(
     engine_block_size: usize,
 ) -> Result<BuiltRuntimeInput> {
     ensure!(engine_block_size > 0, "engine block size must be positive");
+    if let Some(profile) = &traffic.agentic_profile {
+        profile.validate()?;
+        ensure!(
+            traffic.agentic_snapshot.is_some(),
+            "agentic_profile requires agentic_snapshot"
+        );
+        ensure!(
+            traffic.max_sim_time_ms.is_none(),
+            "agentic_profile cannot be combined with max virtual time"
+        );
+    }
     ensure!(
         !traffic.agentic_warmup || traffic.agentic_snapshot.is_some(),
         "agentic_warmup requires agentic_snapshot"
@@ -1362,11 +1737,16 @@ fn run_with_input(
     factory: ReplayEngineFactory,
     input: Option<ReplayRuntimeInput>,
     capture_artifacts: bool,
+    determinism: ReplayDeterminism,
 ) -> crate::replay::ReplayResult<(crate::replay::ReplayReport, Option<ReplayArtifacts>)> {
     let replayer = match input {
         Some(input) => Replayer::new(spec, factory)?.with_runtime_input(input),
         None => Replayer::new(spec, factory)?,
-    };
+    }
+    .with_capture_options(ReplayCaptureOptions {
+        determinism,
+        ..ReplayCaptureOptions::default()
+    });
     if capture_artifacts {
         let (report, artifacts) =
             replayer.run_with_artifacts(ReplayArtifactKvEventVisibility::Native)?;
@@ -1393,9 +1773,20 @@ impl TimingPowerSource {
 }
 
 fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<TimingEvidenceSummary>> {
+    replay_timing_evidence_with_fpm(sources, false)
+}
+
+fn replay_timing_evidence_with_fpm(
+    sources: &[TimingPowerSource],
+    include_fpm: bool,
+) -> Result<Option<TimingEvidenceSummary>> {
     let mut combined = TimingEvidenceSummary::default();
     for source in sources {
-        let Some(summary) = source.timing.evidence_summary() else {
+        let Some(summary) = source.timing.evidence_summary().or_else(|| {
+            include_fpm
+                .then(|| source.timing.fpm_evidence_summary())
+                .flatten()
+        }) else {
             return Ok(None);
         };
         combined.prefill.try_accumulate(scale_power_phase(
@@ -1408,6 +1799,42 @@ fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<Timing
         )?)?;
     }
     Ok(Some(combined))
+}
+
+fn replay_fpm_query_evidence(sources: &[TimingPowerSource]) -> Result<Option<serde_json::Value>> {
+    let mut providers = Vec::new();
+    for (provider_index, source) in sources.iter().enumerate() {
+        let Some(summary) = source.timing.fpm_evidence_summary() else {
+            continue;
+        };
+        let mut phases = Vec::new();
+        for (name, phase, speedup) in [
+            ("prefill", summary.prefill, source.prefill_speedup_ratio),
+            ("decode", summary.decode, source.decode_speedup_ratio),
+        ] {
+            let phase = scale_power_phase(phase, speedup)?;
+            let operations = phase
+                .operations
+                .into_iter()
+                .filter_map(|operation| {
+                    let details = operation.details?;
+                    (!details.fpm_estimates.is_empty()).then(|| {
+                        serde_json::json!({
+                            "name": operation.name, "fpm_estimates": details.fpm_estimates,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            phases.push(serde_json::json!({"name": name, "operations": operations}));
+        }
+        providers.push(serde_json::json!({"provider_index": provider_index, "phases": phases}));
+    }
+    Ok((!providers.is_empty()).then(|| {
+        serde_json::json!({
+            "schema_version": "1.0", "aggregation": "identical_estimates_with_invocation_counts",
+            "providers": providers,
+        })
+    }))
 }
 
 fn replay_power_stats(summary: &TimingEvidenceSummary) -> Result<TracePowerStats> {
@@ -1455,12 +1882,12 @@ fn replay_performance_diagnostics(summary: Option<&TimingEvidenceSummary>) -> se
     let scope = "accumulated_active_forward_pass_per_gpu";
     let Some(summary) = summary else {
         return serde_json::json!({"status": "unavailable", "scope": scope, "latency_unit": "ms", "phases": [],
-            "unavailable_reason": "selected timing provider does not export operation diagnostics (whole-model FPM and latency-only providers are unsupported)"});
+            "unavailable_reason": "selected timing provider does not export operation diagnostics"});
     };
     let phases = [("prefill", &summary.prefill), ("decode", &summary.decode)].into_iter().map(|(name, phase)| {
         let mut operations = phase.operations.iter().map(|op| {
             let sol = op.details.as_ref().and_then(|d| d.sol.as_ref());
-            serde_json::json!({"name": op.name, "latency_ms": op.latency_ms,
+            let mut record = serde_json::json!({"name": op.name, "latency_ms": op.latency_ms,
                 "source": op.source.as_str(),
                 "sol": sol,
                 "sol_unavailable_reason": if sol.is_some() { None } else {
@@ -1468,7 +1895,11 @@ fn replay_performance_diagnostics(summary: Option<&TimingEvidenceSummary>) -> se
                 },
                 "latency_to_sol_ratio": sol.filter(|s| s.latency_ms > 0.0).map(|s| op.latency_ms / s.latency_ms).filter(|r| r.is_finite()),
                 "fallbacks": op.details.as_ref().map(|d| &d.fallbacks),
-            })
+            });
+            if let Some(details) = &op.details && !details.fpm_estimates.is_empty() {
+                record["fpm_estimates"] = serde_json::to_value(&details.fpm_estimates).expect("finite native FPM evidence");
+            }
+            record
         }).collect::<Vec<_>>();
         operations.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
         let sol = phase.operations.iter().map(|op| op.details.as_ref()?.sol.as_ref()).collect::<Option<Vec<_>>>()
@@ -1664,6 +2095,11 @@ fn scale_power_phase(
         operation.energy_wms = operation.energy_wms.map(|energy| energy * scale);
         operation.latency_ms *= scale;
         operation.covered_latency_ms *= scale;
+        if let Some(details) = &mut operation.details {
+            for evidence in &mut details.fpm_estimates {
+                evidence.latency_scale *= scale;
+            }
+        }
         // SOL compares the same scheduled work, before synthetic speedup; it
         // remains an unscaled physical baseline.
     }
@@ -1701,16 +2137,112 @@ fn infer_aic_timing_topology(engine: &mut serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct ReplayCoverageFailure {
+    error: anyhow::Error,
+    coverage: serde_json::Value,
+}
+
+impl std::fmt::Display for ReplayCoverageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ReplayCoverageFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+fn replay_failure(
+    error: anyhow::Error,
+    coverage: Result<Option<serde_json::Value>>,
+) -> anyhow::Error {
+    match coverage {
+        Ok(Some(coverage)) => ReplayCoverageFailure { error, coverage }.into(),
+        Ok(None) => error,
+        Err(coverage_error) => error.context(format!(
+            "FPM coverage diagnostics failed: {coverage_error:#}"
+        )),
+    }
+}
+
+fn replay_fpm_coverage(
+    sources: &[(ForwardPassWorkerType, Arc<ForwardPassPerfModel>)],
+    report: Option<&crate::replay::ReplayReport>,
+) -> Result<Option<serde_json::Value>> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let mut measured = 0u64;
+    let mut interpolated = 0u64;
+    let mut unsupported = 0u64;
+    let mut roles = Vec::with_capacity(sources.len());
+    for (role, model) in sources {
+        let coverage = model
+            .fpm_query_coverage()?
+            .context("requested FPM query coverage is unavailable")?;
+        measured += coverage.queries.measured;
+        interpolated += coverage.queries.interpolated;
+        unsupported += coverage.queries.unsupported;
+        roles.push(serde_json::json!({"worker_type": role, "coverage": coverage}));
+    }
+    let replay_completed = report.is_some_and(|report| {
+        let counts = &report.request_counts;
+        counts.num_requests > 0
+            && counts.completed_requests == counts.num_requests
+            && report.agentic_graph.as_ref().is_none_or(|graph| {
+                graph.node_count == counts.completed_requests
+                    && report
+                        .agentic_play_outcomes
+                        .as_ref()
+                        .is_some_and(|outcomes| {
+                            outcomes.len() == graph.play_count
+                                && outcomes.iter().all(|outcome| {
+                                    matches!(
+                                        outcome.status,
+                                        crate::replay::loadgen::AgenticPlayStatus::Completed
+                                    )
+                                })
+                        })
+            })
+    });
+    let covered = replay_completed && measured + interpolated > 0 && unsupported == 0;
+    Ok(Some(serde_json::json!({
+        "schema_version": 1,
+        "status": if covered { "covered" } else { "incomplete" },
+        "replay_completed": replay_completed,
+        "counting_unit": "native_lookup_resolutions",
+        "queries": {"measured": measured, "interpolated": interpolated, "unsupported": unsupported},
+        "roles": roles,
+        "accuracy": "not_assessed",
+    })))
+}
+
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    let (mut spec, mut traffic, capture_performance_diagnostics) =
+    let (mut spec, mut traffic, capture_performance_diagnostics, determinism) =
         match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
             ExecutionPayload::Configured {
                 spec,
                 traffic,
                 capture_performance_diagnostics,
-            } => (spec, traffic.map(|t| *t), capture_performance_diagnostics),
-            ExecutionPayload::Legacy(spec) => (spec, None, false),
+                determinism,
+            } => (
+                spec,
+                traffic.map(|t| *t),
+                capture_performance_diagnostics,
+                determinism,
+            ),
+            ExecutionPayload::Legacy(spec) => (spec, None, false, ReplayDeterminism::default()),
         };
+    ensure!(
+        spec.max_sim_time_ms.is_none()
+            || traffic
+                .as_ref()
+                .is_none_or(|traffic| traffic.agentic_profile.is_none()),
+        "agentic_profile cannot be combined with ReplaySpec.max_sim_time_ms"
+    );
     let agentic_input = traffic.as_ref().and_then(|traffic| {
         traffic
             .trace_format
@@ -1744,8 +2276,10 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         ReplayTopology::Disaggregated { .. } => 2,
     };
     let mut power_sources = Vec::with_capacity(expected_power_sources);
+    let mut coverage_sources = Vec::new();
 
-    let (mut report, artifacts, resolved_weka_timestamp_basis) = match spec.topology.clone() {
+    let replay_result = (|| -> Result<_> {
+        match spec.topology.clone() {
         ReplayTopology::Aggregated { .. } => {
             let mut role = aggregated_role(&engine_config);
             let capacity_is_explicit = role
@@ -1756,6 +2290,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 capacity_is_explicit,
                 ForwardPassWorkerType::Aggregated,
                 capture_performance_diagnostics,
+                &mut coverage_sources,
             )?;
             if let Some(timing) = timing.as_ref() {
                 power_sources.push(TimingPowerSource::new(Arc::clone(timing), &role.rank));
@@ -1785,7 +2320,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 .map(|traffic| build_runtime_input(traffic, engine_config.rank.block_size))
                 .transpose()?;
             if let Some(built) = &built_input {
-                validate_public_agentic_engine(&built.input, &engine_config.rank)?;
+                validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
             let resolved_basis = built_input
                 .as_ref()
@@ -1795,7 +2330,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ReplayEngineFactory::new,
                 ReplayEngineFactory::with_timing_model,
             );
-            run_with_input(spec, factory, input, capture_artifacts)
+            run_with_input(spec, factory, input, capture_artifacts, determinism)
                 .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
         ReplayTopology::Disaggregated { .. } => {
@@ -1854,12 +2389,14 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 prefill_capacity_is_explicit,
                 ForwardPassWorkerType::Prefill,
                 capture_performance_diagnostics,
+                &mut coverage_sources,
             )?;
             let decode_timing = resolve_role_timing(
                 &mut decode,
                 decode_capacity_is_explicit,
                 ForwardPassWorkerType::Decode,
                 capture_performance_diagnostics,
+                &mut coverage_sources,
             )?;
             if let Some(timing) = prefill_timing.as_ref() {
                 power_sources.push(TimingPowerSource::new(Arc::clone(timing), &prefill.rank));
@@ -1900,12 +2437,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 .transpose()?,
             };
             if let Some(built) = &built_input {
-                for role in [&engine_config.prefill, &engine_config.decode] {
-                    validate_public_agentic_engine(
-                        &built.input,
-                        &role.as_ref().expect("P/D role was materialized").rank,
-                    )?;
-                }
+                validate_public_agentic_engine(&built.input, &spec, &engine_config)?;
             }
             let resolved_basis = built_input
                 .as_ref()
@@ -1919,11 +2451,23 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ),
                 input,
                 capture_artifacts,
+                determinism,
             )
             .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
-    }
-    .context("AISimulate replay failed")?;
+        }
+        .map_err(Into::into)
+    })()
+    .context("AISimulate replay failed");
+    let (mut report, artifacts, resolved_weka_timestamp_basis) = match replay_result {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(replay_failure(
+                error,
+                replay_fpm_coverage(&coverage_sources, None),
+            ));
+        }
+    };
     let (timing_evidence, unavailable_reason) = if power_sources.len() == expected_power_sources {
         (
             replay_timing_evidence(&power_sources)?,
@@ -1947,9 +2491,16 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     )?));
     let mut report_json =
         serde_json::to_value(&report).context("serializing AISimulate replay report summary")?;
+    if let Some(coverage) = replay_fpm_coverage(&coverage_sources, Some(&report))? {
+        report_json["fpm_query_coverage"] = coverage;
+    }
     if capture_performance_diagnostics {
+        let performance_evidence = replay_timing_evidence_with_fpm(&power_sources, true)?;
         report_json["performance_diagnostics"] =
-            replay_performance_diagnostics(timing_evidence.as_ref());
+            replay_performance_diagnostics(performance_evidence.as_ref());
+    }
+    if let Some(evidence) = replay_fpm_query_evidence(&power_sources)? {
+        report_json["fpm_query_evidence"] = evidence;
     }
     if report.agentic_graph.is_some()
         && let Some((input_format, agentic_lanes, execution_model)) = agentic_input
@@ -2018,7 +2569,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
 }
 
 fn replay_python_error(error: anyhow::Error) -> PyErr {
-    if error.chain().any(|cause| {
+    let exception = if error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<crate::replay::ReplayError>(),
             Some(crate::replay::ReplayError::ResourceLimited(_))
@@ -2027,7 +2578,15 @@ fn replay_python_error(error: anyhow::Error) -> PyErr {
         PyMemoryError::new_err(format!("{error:#}"))
     } else {
         PyRuntimeError::new_err(format!("{error:#}"))
+    };
+    if let Some(failure) = error.downcast_ref::<ReplayCoverageFailure>() {
+        Python::with_gil(|py| {
+            let _ = exception
+                .value(py)
+                .setattr("fpm_query_coverage", failure.coverage.to_string());
+        });
     }
+    exception
 }
 
 /// Execute one canonical serialized ReplaySpec and return serialized report JSON.
@@ -2044,9 +2603,64 @@ fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<Str
         .map_err(replay_python_error)
 }
 
+#[pyfunction]
+fn canonical_timing_config_json(payload: &str, worker_type: &str) -> PyResult<String> {
+    let convert = || -> anyhow::Result<String> {
+        let timing: AicTimingConfig = serde_json::from_str(payload)?;
+        let role = serde_json::from_value(serde_json::json!(worker_type))?;
+        let config = timing.estimator_request(role)?;
+        config.validate()?;
+        Ok(serde_json::to_string(&config)?)
+    };
+    convert().map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))
+}
+
+/// Share the Runner's resolved role descriptor with downstream adapters.
+#[pyfunction]
+#[pyo3(signature = (payload, startup_time=None))]
+fn engine_launch_from_replay_role_json(
+    payload: &str,
+    startup_time: Option<f64>,
+) -> PyResult<String> {
+    let convert = || -> anyhow::Result<String> {
+        let role: crate::replay::ReplayRoleConfig = serde_json::from_str(payload)?;
+        let mut launch = crate::engine::EngineLaunchConfig {
+            engine: role.rank,
+            dp_size: role.dp_size,
+            tensor_parallel_size: role.tensor_parallel_size as usize,
+            num_gpu_blocks_is_explicit: role.num_gpu_blocks_is_explicit.unwrap_or(false),
+            startup_time,
+            ..Default::default()
+        };
+        if let crate::engine::TimingModelConfig::External { provider, config } =
+            &launch.engine.timing_model
+            && matches!(provider.as_str(), "aic" | "ais")
+        {
+            let timing: AicTimingConfig = serde_json::from_value(config.clone())?;
+            let worker_type = serde_json::from_value(serde_json::to_value(launch.worker_type)?)?;
+            let canonical = timing.estimator_request(worker_type)?;
+            launch.gpu_memory_utilization = timing.gpu_memory_utilization;
+            launch.mem_fraction_static = timing.mem_fraction_static;
+            launch.free_gpu_memory_fraction = timing.free_gpu_memory_fraction;
+            launch.cuda_graph_reserved_bytes = Some(timing.cuda_graph_reserved_bytes);
+            launch.engine.timing_model = crate::engine::TimingModelConfig::External {
+                provider: "ais".into(),
+                config: serde_json::to_value(canonical)?,
+            };
+        }
+        Ok(serde_json::to_string(&launch.normalized()?)?)
+    };
+    convert().map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))
+}
+
 /// AISimulate native runtime module.
 #[pymodule]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(
+        engine_launch_from_replay_role_json,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     crate::perfmodel::register_python(module)?;
@@ -2062,6 +2676,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn replay_coverage_errors_preserve_the_original_chain() {
+        let original = || anyhow::anyhow!("original failure").context("AISimulate replay failed");
+        let wrapped = replay_failure(original(), Ok(Some(serde_json::json!({}))));
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "AISimulate replay failed: original failure"
+        );
+        let missing = replay_failure(original(), Err(anyhow::anyhow!("coverage unavailable")));
+        assert_eq!(
+            format!("{missing:#}"),
+            "FPM coverage diagnostics failed: coverage unavailable: AISimulate replay failed: original failure"
+        );
+    }
 
     #[test]
     fn replay_python_error_preserves_contextual_resource_failure() {
@@ -2155,6 +2784,97 @@ mod tests {
     }
 
     #[test]
+    fn profile_options_are_opt_in_and_strict_at_the_native_boundary() {
+        let base = serde_json::json!({
+            "source_type": "trace", "load_type": "trace_timestamps",
+            "trace_path": "unused", "trace_format": "weka", "agentic_lanes": 1,
+            "agentic_snapshot": {"seed": 42},
+        });
+        assert!(
+            serde_json::from_value::<RuntimeTraffic>(base.clone())
+                .unwrap()
+                .agentic_profile
+                .is_none()
+        );
+        let mut traffic = base.clone();
+        traffic["agentic_profile"] = serde_json::json!({});
+        let profile = serde_json::from_value::<RuntimeTraffic>(traffic.clone())
+            .unwrap()
+            .agentic_profile
+            .unwrap();
+        assert_eq!(profile.duration_seconds, 3600.0);
+        assert_eq!(profile.response_grace_seconds, 30.0);
+        assert_eq!(profile.cancel_drain_seconds, 10.0);
+        assert_eq!(profile.tree_idle_cap_seconds, 300.0);
+        assert_eq!(profile.global_idle_cap_seconds, 10.0);
+        for invalid in [
+            serde_json::json!(true),
+            serde_json::json!({"duration_seconds": true}),
+            serde_json::json!({"duration_seconds": "1"}),
+            serde_json::json!({"unexpected": 1}),
+        ] {
+            traffic["agentic_profile"] = invalid;
+            assert!(serde_json::from_value::<RuntimeTraffic>(traffic.clone()).is_err());
+        }
+        for invalid in [
+            serde_json::json!({"duration_seconds": 0}),
+            serde_json::json!({"response_grace_seconds": -1}),
+            serde_json::json!({"cancel_drain_seconds": -1}),
+            serde_json::json!({"tree_idle_cap_seconds": 0}),
+            serde_json::json!({"global_idle_cap_seconds": 0}),
+        ] {
+            traffic["agentic_profile"] = invalid;
+            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic.clone()).unwrap();
+            assert!(
+                build_runtime_input(traffic, 64)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("agentic_profile")
+            );
+        }
+        for (field, value, message) in [
+            (
+                "agentic_snapshot",
+                serde_json::Value::Null,
+                "requires agentic_snapshot",
+            ),
+            (
+                "max_sim_time_ms",
+                serde_json::json!(1.0),
+                "cannot be combined",
+            ),
+        ] {
+            let mut traffic = base.clone();
+            traffic["agentic_profile"] = serde_json::json!({});
+            traffic[field] = value;
+            let traffic = serde_json::from_value::<RuntimeTraffic>(traffic).unwrap();
+            assert!(
+                build_runtime_input(traffic, 64)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains(message)
+            );
+        }
+        let payload = serde_json::json!({
+            "spec": {
+                "version": 1,
+                "topology": {"kind": "aggregated", "workers": {"initial_workers": 1}},
+                "max_sim_time_ms": 1.0,
+                "requests": []
+            },
+            "traffic": {"agentic_profile": {}, "source_type": "trace"}
+        });
+        assert!(
+            execute_json(&payload.to_string(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("agentic_profile cannot be combined with ReplaySpec.max_sim_time_ms")
+        );
+    }
+
+    #[test]
     fn snapshot_options_are_strict_at_the_native_json_boundary() {
         let base = serde_json::json!({
             "source_type": "trace", "load_type": "trace_timestamps",
@@ -2190,6 +2910,108 @@ mod tests {
                     .to_string()
                     .contains("agentic_snapshot requires")
             );
+        }
+    }
+
+    #[test]
+    fn public_agentic_json_host_offload_validates_the_whole_deployment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original-weka.jsonl");
+        std::fs::write(&path, serde_json::json!({
+            "id": "play", "models": ["model"], "block_size": 4, "hash_id_scope": "local",
+            "requests": [{"t": 0.0, "type": "s", "model": "model", "in": 4, "out": 1, "hash_ids": [1]}]
+        }).to_string()).unwrap();
+        let rank = serde_json::json!({
+            "backend": "vllm", "block_size": 4, "num_gpu_blocks": 16,
+            "kv_cache_bytes_per_token": 16,
+            "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+        });
+        let with_host = |scope: Option<&str>| {
+            let mut rank = rank.clone();
+            if let Some(scope) = scope {
+                rank["native_host_offload"] = serde_json::json!({
+                    "scope": scope, "num_host_blocks": 8, "kv_layout_id": "original-test-layout"
+                });
+            }
+            serde_json::json!({"tensor_parallel_size": 2, "rank": rank})
+        };
+        let payload = |topology, engine| {
+            serde_json::json!({
+                "spec": {"version": 1, "topology": topology, "engine": engine, "requests": []},
+                "traffic": {
+                    "source_type": "trace", "load_type": "trace_timestamps", "trace_format": "weka",
+                    "trace_path": path, "trace_block_size": 4, "execution_model": "model"
+                }
+            })
+        };
+        let run = |payload: &serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&execute_json(&payload.to_string(), false).unwrap()).unwrap()
+        };
+        let scopes = [None, Some("dp_rank_local"), Some("cluster_shared")];
+        for scope in scopes {
+            let agg = payload(
+                serde_json::json!({"kind": "aggregated", "workers": {"initial_workers": 1}}),
+                with_host(scope),
+            );
+            let report = run(&agg);
+            assert_eq!(report["completed_requests"], 1);
+            for other in scopes {
+                let pd = payload(
+                    serde_json::json!({"kind": "disaggregated", "prefill": {"initial_workers": 1}, "decode": {"initial_workers": 1}}),
+                    serde_json::json!({"prefill": with_host(scope), "decode": with_host(other)}),
+                );
+                let report = run(&pd);
+                assert_eq!(report["completed_requests"], 1, "{scope:?}/{other:?}");
+                if scope.is_none() && other.is_none() {
+                    continue;
+                }
+                for (pointer, value, message) in [
+                    (
+                        "/spec/topology/prefill/initial_workers",
+                        serde_json::json!(2),
+                        "one aggregated worker or one prefill and one decode worker",
+                    ),
+                    (
+                        "/spec/topology/decode/initial_workers",
+                        serde_json::json!(2),
+                        "one aggregated worker or one prefill and one decode worker",
+                    ),
+                    ("/spec/engine/prefill/dp_size", serde_json::json!(2), "DP=1"),
+                    ("/spec/engine/decode/dp_size", serde_json::json!(2), "DP=1"),
+                    (
+                        "/spec/engine/prefill/rank/backend",
+                        serde_json::json!("sglang"),
+                        "backend=vllm",
+                    ),
+                    (
+                        "/spec/engine/decode/rank/backend",
+                        serde_json::json!("sglang"),
+                        "backend=vllm",
+                    ),
+                    (
+                        "/spec/engine/decode/rank/aic_nextn",
+                        serde_json::json!(1),
+                        "speculative decoding disabled",
+                    ),
+                    (
+                        "/spec/engine/decode/rank/g3_offload",
+                        serde_json::json!({"scope": "worker_local", "num_g3_blocks": 8}),
+                        "G3",
+                    ),
+                ] {
+                    let mut invalid = pd.clone();
+                    let (parent, key) = pointer.rsplit_once('/').unwrap();
+                    invalid.pointer_mut(parent).unwrap()[key] = value;
+                    let error = format!(
+                        "{:#}",
+                        execute_json(&invalid.to_string(), false).unwrap_err()
+                    );
+                    assert!(
+                        error.contains(message),
+                        "{scope:?}/{other:?} {pointer}: {error}"
+                    );
+                }
+            }
         }
     }
 
@@ -2253,13 +3075,6 @@ mod tests {
                 (
                     serde_json::json!({"aic_nextn": 1}),
                     "speculative decoding disabled",
-                ),
-                (
-                    serde_json::json!({
-                        "kv_cache_bytes_per_token": 16,
-                        "native_host_offload": {"num_host_blocks": 8}
-                    }),
-                    "HBM-only",
                 ),
             ] {
                 let mut rank = serde_json::json!({
@@ -2515,11 +3330,13 @@ mod tests {
         AicTimingModel {
             engine,
             diagnostic_model: None,
+            fpm_model: None,
             decoder_replay: false,
             phase_provider: AicPhaseProvider::Python,
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling: None,
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
+            fpm_evidence: Mutex::default(),
             phase_cache: quick_cache::sync::Cache::new(128),
         }
     }
@@ -2681,6 +3498,8 @@ mod tests {
         // test engine is synthetic; the production constructor is unchanged.
         let missing_op = |phase| {
             Op::FpmForward(FpmForwardOp {
+                dcp_size: None,
+                interpolation: Default::default(),
                 name: "missing".into(),
                 phase,
                 model_path: "missing-test-model".into(),
@@ -2744,6 +3563,24 @@ mod tests {
     }
 
     #[test]
+    fn estimator_request_carries_both_context_parallel_knobs() {
+        // The native estimator path builds the engine from this request, so a
+        // dropped knob would silently price a dcp=1 engine for a dcp=8 worker.
+        let mut config = aic_config();
+        config.cp_size = Some(2);
+        config.dcp = Some(4);
+        let request = config
+            .estimator_request(ForwardPassWorkerType::Aggregated)
+            .unwrap();
+        assert_eq!(request.cp_size, Some(2));
+        assert_eq!(request.dcp, Some(4));
+        let unset = aic_config()
+            .estimator_request(ForwardPassWorkerType::Aggregated)
+            .unwrap();
+        assert_eq!((unset.cp_size, unset.dcp), (None, None));
+    }
+
+    #[test]
     fn canonical_and_legacy_default_selection_are_distinct() {
         let mut config = aic_config();
         assert_eq!(
@@ -2770,6 +3607,34 @@ mod tests {
     }
 
     #[test]
+    fn replay_interpolation_migration_preserves_explicit_method_presence() {
+        for canonical in [None, Some("direct"), Some("auto"), Some("sol")] {
+            let mut config = aic_config();
+            config.fpm_interpolation = Some(crate::FpmInterpolationMethod::Direct);
+            config.estimator_config = serde_json::from_value(serde_json::json!({
+                "correction": {"enabled": false},
+                "fpm_interpolation": canonical
+                    .map(|method| serde_json::json!({"method": method}))
+                    .unwrap_or_else(|| serde_json::json!({}))
+            }))
+            .unwrap();
+            let request = config.estimator_request(ForwardPassWorkerType::Aggregated);
+            if canonical.is_none() || canonical == Some("direct") {
+                let controls = request.unwrap().estimator_config;
+                assert_eq!(
+                    controls.fpm_interpolation.method,
+                    crate::FpmInterpolationMethod::Direct
+                );
+                assert!(!controls.correction.enabled);
+            } else {
+                assert!(request.unwrap_err().to_string().contains(
+                    "conflicting explicit values for estimator_config.fpm_interpolation.method"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn canonical_timing_config_preserves_moe_kernel_source() {
         let mut config = aic_config();
         config.moe_kernel_source = Some("sglang_flashinfer_trtllm_moe".into());
@@ -2793,8 +3658,10 @@ mod tests {
             backend_version: None,
             pp: 1,
             attention_dp: 1,
+            dcp: None,
             moe_tp_size: None,
             moe_ep_size: None,
+            cp_size: None,
             gemm_dtype: None,
             moe_dtype: None,
             fmha_dtype: None,
@@ -2811,7 +3678,7 @@ mod tests {
             worker_type: None,
             estimation_mode: None,
             fallback_policy: ForwardPassFallbackPolicy::Deny,
-            estimator_config: EstimatorConfig::default(),
+            estimator_config: serde_json::Map::new(),
             database_mode: crate::DatabaseMode::default(),
             transfer_policy: None,
             systems_paths: Vec::new(),
@@ -2824,9 +3691,77 @@ mod tests {
             strict_provenance: false,
             systems_path: None,
             forward_model: None,
+            fpm_profile: None,
+            fpm_interpolation: None,
+            decode_workload_distribution: None,
             fpm_parquet_path: None,
             decoder_replay: false,
         }
+    }
+
+    #[test]
+    fn parallel_shape_folds_prefill_cp_but_not_decode_cp_into_width() {
+        let mut config = aic_config();
+        config.tp = 1;
+        config.attention_dp = 1;
+        config.moe_tp_size = Some(1);
+        config.moe_ep_size = Some(8);
+        // Prefill CP widens the attention side to match the MoE width ...
+        config.cp_size = Some(8);
+        config.dcp = Some(8);
+        config.validate_parallel_shape().unwrap();
+        // ... decode CP does not: without prefill CP the widths no longer match.
+        config.cp_size = None;
+        assert!(config.validate_parallel_shape().is_err());
+        // Zero is rejected like every other parallel size.
+        config.cp_size = Some(8);
+        config.dcp = Some(0);
+        assert!(config.validate_parallel_shape().is_err());
+    }
+
+    #[test]
+    fn fixed_capacity_does_not_require_vllm_pp1_profile_resources() {
+        for (backend, pp) in [("sglang", 1), ("vllm", 2)] {
+            let mut config = aic_config();
+            config.backend = backend.into();
+            config.pp = pp;
+            config.fpm_profile = Some(serde_json::Map::new());
+            let mut role = aggregated_role(&ReplayEngineConfig::default());
+            role.rank.backend = if backend == "sglang" {
+                Backend::Sglang
+            } else {
+                Backend::Vllm
+            };
+            materialize_aic_capacity(&config, &mut role, true, |_, _| unreachable!()).unwrap();
+        }
+    }
+
+    #[test]
+    fn grouped_load_and_timing_domain_preserve_byte_capacity() {
+        let mut role = aggregated_role(&ReplayEngineConfig::default());
+        role.dp_size = 3;
+        role.rank.kv_cache_groups = serde_json::from_value(serde_json::json!([{
+            "name":"window", "kind":"attention", "num_layers":1,
+            "block_size_tokens":16, "page_size_bytes":160, "sliding_window":32
+        }]))
+        .unwrap();
+        role.rank.kv_cache_capacity_bytes = Some(1000);
+        cap_role_capacity_to_fpm_decode_domain(&mut role, Some(1), false).unwrap();
+        assert_eq!(role.rank.kv_cache_capacity_bytes, Some(1000));
+        let mut traffic: RuntimeTraffic = serde_json::from_value(serde_json::json!({
+            "source_type":"synthetic", "load_type":"kv_capacity_fraction",
+            "kv_load_ratio":1.0, "isl":1152, "osl":4
+        }))
+        .unwrap();
+        // A 32-token window can straddle three 16-token pages (480 bytes).
+        // Each rank holds two requests; three DP ranks and two replicas hold 12.
+        assert_eq!(
+            resolve_kv_capacity_concurrency(&mut traffic, &role, 2).unwrap(),
+            Some(12)
+        );
+        assert_eq!(traffic.concurrency, Some(12));
+        role.rank.kv_cache_capacity_bytes = Some(479);
+        assert!(resolve_kv_capacity_concurrency(&mut traffic, &role, 2).is_err());
     }
 
     #[test]
@@ -2881,6 +3816,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(role.rank.num_gpu_blocks, 17);
+    }
+
+    #[test]
+    fn dcp_capacity_is_estimated_on_the_kv_stripe() {
+        // The KV-capacity estimator prices the 1/dcp stripe (memory.py's
+        // `_cp_kv_memory_divisor`), so automatic sizing stays available under
+        // DCP; explicit capacity still bypasses the estimator.
+        let mut config = aic_config();
+        config.tp = 4;
+        config.dcp = Some(4);
+        let mut role = aggregated_role(&ReplayEngineConfig::default());
+        role.tensor_parallel_size = 4;
+        role.rank.num_gpu_blocks = 17;
+
+        materialize_aic_capacity(&config, &mut role, false, |_, _| Ok(4 * 321)).unwrap();
+        assert_eq!(role.rank.num_gpu_blocks, 4 * 321);
+
+        role.rank.num_gpu_blocks = 17;
+        materialize_aic_capacity(&config, &mut role, true, |_, _| {
+            panic!("explicit DCP capacity must not invoke the estimator")
+        })
+        .unwrap();
+        assert_eq!(role.rank.num_gpu_blocks, 17);
+    }
+
+    #[test]
+    fn replay_provider_rejects_graph_profile_before_native_construction() {
+        let mut config = aic_config();
+        config.estimator_config.insert(
+            "op_level".into(),
+            serde_json::json!({"prefill_graph_profile": crate::perf_database::prefill_graph::PROFILE_NAME}),
+        );
+        for role in [
+            ForwardPassWorkerType::Prefill,
+            ForwardPassWorkerType::Decode,
+            ForwardPassWorkerType::Aggregated,
+        ] {
+            let error = AicTimingModel::build(&mut config, role).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("replay/scheduler timing is unqualified")
+            );
+        }
     }
 
     #[test]
@@ -3283,6 +4262,7 @@ mod tests {
             TimingOperationEvidence::new("dispatch", 10.0, None, TimingEvidenceSource::Estimated)
                 .unwrap();
         op.details = Some(OperationDetails {
+            fpm_estimates: Vec::new(),
             sol: Some(SolDiagnostics {
                 latency_ms: 2.0,
                 math_ms: 0.0,
@@ -3383,10 +4363,20 @@ mod tests {
             "system": "test-system",
             "tp": 1,
             "forward_model": "fpm",
+            "fpm_profile": {"model": "test-model"},
+            "fpm_interpolation": "direct",
             "fpm_parquet_path": "/artifacts/reviewed-fpm.parquet"
         }))
         .unwrap();
         assert_eq!(config.forward_model.as_deref(), Some("fpm"));
+        assert_eq!(
+            config.fpm_profile,
+            Some(serde_json::from_value(serde_json::json!({"model": "test-model"})).unwrap())
+        );
+        assert_eq!(
+            config.fpm_interpolation,
+            Some(crate::FpmInterpolationMethod::Direct)
+        );
         assert_eq!(
             config.fpm_parquet_path.as_deref(),
             Some("/artifacts/reviewed-fpm.parquet")
@@ -3437,6 +4427,13 @@ mod tests {
 
         assert_eq!(latency, 546_046.0);
         assert_eq!(timing.evidence_summary(), None);
+        assert_eq!(timing.fpm_evidence_summary(), None);
+        // Capture is disabled: even a long sequence of distinct total-KV
+        // queries cannot allocate a growing evidence history.
+        for kv in 546_100..547_100 {
+            timing.predict_decode_ms(35, kv, 15_602, 1_000_000).unwrap();
+        }
+        assert!(timing.fpm_evidence.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3634,10 +4631,10 @@ mod tests {
         });
         let mut timing = python_timing_model(engine, false);
         timing.phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
-        timing.diagnostic_model = Some(ForwardPassPerfModel::from_engine(
+        timing.diagnostic_model = Some(Arc::new(ForwardPassPerfModel::from_engine(
             native,
             ForwardPassPerfOptions::default(),
-        ));
+        )));
         for kind in ["diagnostics", "evidence"] {
             for mode in ["static_ctx", "static_gen"] {
                 let error = timing

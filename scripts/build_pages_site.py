@@ -56,7 +56,9 @@ def _copy_page_directory(source: Path, destination: Path) -> None:
     if not (source / "index.html").is_file():
         raise PagesBuildError(f"public page has no index.html: {source}")
     for asset in sorted(source.rglob("*")):
-        if not asset.is_file() or asset.suffix.lower() not in PUBLIC_ASSET_SUFFIXES:
+        if not asset.is_file() or (
+            asset.suffix.lower() not in PUBLIC_ASSET_SUFFIXES and asset.name != "PLOTLY-LICENSE.txt"
+        ):
             continue
         _copy_file(asset, destination / asset.relative_to(source))
 
@@ -288,6 +290,11 @@ def _accuracy_summary(text: str) -> dict:
                 and isinstance(aic_source.get("commit_sha"), str)
                 and bool(re.fullmatch(r"[0-9a-f]{40}", aic_source["commit_sha"]))
                 and aic_source["commit_sha"] == snapshot.get("aic_commit_sha")
+                and (
+                    "cli_entry_point" not in aic_source
+                    or aic_source["cli_entry_point"]
+                    in ("aiconfigurator.main:main", "aisimulate.legacy_cli.entrypoint:main")
+                )
                 and (revision is None or all(aic_source[key] == revision[key] for key in ("branch", "commit_sha"))),
                 "legacy AIC CLI source",
             )
@@ -448,6 +455,11 @@ def _build_fpm_catalog(repo_root: Path, output_dir: Path, include_refs: bool, ar
             head = _git(repo_root, "rev-parse", "origin/" + branch) if include_refs else None
             entry.update(status="available", summary_path=relative, head_sha=head)
         entries.append(entry)
+    if artifacts is not None and (artifacts / "dashboard").exists():
+        dashboard = artifacts / "dashboard"
+        if dashboard.is_symlink() or any(path.is_symlink() for path in dashboard.rglob("*")):
+            raise PagesBuildError("FPM dashboard cannot contain symlinks")
+        shutil.copytree(dashboard, output_dir / "fpm-accuracy/data", dirs_exist_ok=True)
     catalog = {"schema_version": 1, "default_branch": "main", "branches": entries}
     (output_dir / "fpm-accuracy/branches.json").write_text(json.dumps(catalog, indent=2) + "\n")
 

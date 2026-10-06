@@ -9,6 +9,7 @@ capacity. They are conservative planning estimates, not promises about peak RSS.
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import itertools
 import json
@@ -247,24 +248,43 @@ def workload_bounds(config: Any) -> dict[str, Any]:
     }
 
 
-def _weka_active_inputs(intervals: list[tuple[float, float, int]]) -> int:
+def _weka_active_inputs(intervals: list[tuple[float, float, int, int | None]]) -> int:
     """Bound the input tokens in a scope's causally concurrent requests.
 
-    Weka's sequence edges and cross-stream completion frontiers order requests
-    whose recorded intervals do not overlap. Equal starts remain concurrent,
-    including requests with no recorded API duration. Ignoring the importer's
-    time epsilon only increases this bound. Different scopes are summed.
+    Sequence edges and completion frontiers normally order disjoint intervals.
+    Hashless requests and epsilon joins can break a chain's recorded-end order;
+    reserve all scope inputs in those cases. A detached preamble can also hide
+    one main-stream request behind its later recorded end. Different scopes
+    are summed, and equal starts remain concurrent even with zero API duration.
     """
+    total = sum(item[2] for item in intervals)
+    if any(item[3] is None for item in intervals):
+        return total
+    ordered = sorted(intervals, key=lambda item: item[0])
+    ends = sorted(item[1] for item in ordered)
+    for start, end, _, _ in ordered:
+        # Match JOIN_EPSILON_SECONDS in the native Weka importer. If a
+        # near-zero-duration request can extend a not-quite-finished chain,
+        # its end may precede the predecessor selected by another frontier.
+        next_end = bisect.bisect_right(ends, end)
+        if next_end < len(ends) and ends[next_end] <= start + 1e-6:
+            return total
     pending: list[tuple[float, int]] = []
     active = peak = 0
-    for start, group in itertools.groupby(sorted(intervals), key=lambda item: item[0]):
+    for start, group in itertools.groupby(ordered, key=lambda item: item[0]):
         while pending and pending[0][0] <= start:
             active -= heapq.heappop(pending)[1]
-        for _, end, tokens in group:
+        for _, end, tokens, _ in group:
             heapq.heappush(pending, (end, tokens))
             active += tokens
         peak = max(peak, active)
-    return peak
+    if ordered and all(item[3] != ordered[0][3] for item in ordered[1:]):
+        # split_preamble may prepend a disjoint first request to the main
+        # stream regardless of its recorded end. A frontier can then select
+        # that preamble while a later main request is still active. Only one
+        # such main request can run; other streams retain the interval bound.
+        peak += max((item[2] for item in ordered[1:] if item[1] < ordered[0][1]), default=0)
+    return min(total, peak)
 
 
 def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes: int | None) -> ResourceEstimate:
@@ -307,7 +327,7 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                 frames: list[tuple[str, dict[str, Any] | None]] = []
                 scopes: list[tuple[str, int]] = []
                 requests: list[dict[str, Any]] = []
-                intervals: list[list[tuple[float, float, int]]] = []
+                intervals: list[list[tuple[float, float, int, int | None]]] = []
                 document_start = 0
                 with path.open("rb") as stream:
                     for prefix, event, value in ijson.parse(stream, multiple_values=True, buf_size=buffer_size):
@@ -317,7 +337,7 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                                 requests, intervals = [], []
                                 frame = {}
                             elif scopes and prefix == scopes[-1][0] + ".item":
-                                frame = {"scope": scopes[-1][1], "hash_count": 0}
+                                frame = {"scope": scopes[-1][1], "hash_count": 0, "first_hash": None}
                             else:
                                 frame = None
                             frames.append((prefix, frame))
@@ -341,7 +361,7 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                                 end = start + duration
                                 if min(start, duration) < 0 or not all(map(math.isfinite, (start, duration, end))):
                                     raise ValueError("Weka request times must be finite and nonnegative")
-                                intervals[frame["scope"]].append((start, end, frame["in"]))
+                                intervals[frame["scope"]].append((start, end, frame["in"], frame["first_hash"]))
                                 requests.append(frame)
                                 continue
                             block_size = frame.get("block_size")
@@ -384,6 +404,8 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                             elif member == "hash_ids.item":
                                 if event != "number" or type(value) is not int or not 0 <= value < 2**64:
                                     raise ValueError("Weka hash_ids must contain unsigned 64-bit integers")
+                                if not frame["hash_count"]:
+                                    frame["first_hash"] = value
                                 frame["hash_count"] += 1
     except (OSError, ValueError, TypeError, KeyError, OverflowError, ijson.JSONError) as exc:
         return unqualified(f"cannot inspect Weka metadata: {exc}")

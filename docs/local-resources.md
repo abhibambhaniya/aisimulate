@@ -206,8 +206,12 @@ The planning peak is the 256 MiB process allowance plus the larger of these phas
   sequence and cross-stream completion dependencies bound active inputs by the
   maximum weighted overlap of recorded API intervals in each original request
   array; scopes are then summed. Equal starts are treated as concurrent, including
-  missing/zero API durations. This avoids treating every historical full prompt
-  as simultaneously materialized. The native P/D success path releases its full
+  missing/zero API durations. A possible detached preamble additionally reserves
+  the largest main-stream prompt that its later recorded end could hide from
+  a completion frontier. Scopes with hashless requests or possible end-order
+  reversals within the importer's one-microsecond join tolerance reserve all
+  input lengths. These exceptions cover cases where recorded interval overlap
+  does not bound native concurrency. The native P/D success path releases its full
   original request before admitting requests unblocked by completion.
 
 Ordinary finite lanes partition the corpus. Snapshot lanes cycle through source

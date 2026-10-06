@@ -8,6 +8,7 @@ from copy import deepcopy
 
 import pytest
 
+from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
 from aisimulate.config.common import ResourceConfig
 from aisimulate.resources import (
@@ -19,6 +20,8 @@ from aisimulate.resources import (
     require_plan,
     workload_bounds,
 )
+from aisimulate.runner import EngineReplayRunnerFactory
+from aisimulate.sweeper.replay import ReplayOutputRequirements
 
 
 def _request(input_length=64, output_length=1, *, hashes=None, timestamp=0.0):
@@ -83,6 +86,61 @@ def test_weka_active_inputs_follow_completion_dependencies(tmp_path, timings, ex
     trace = _write_trace(tmp_path, _play(requests))
     estimate = estimate_workload(_workload(trace), stack="engine")
     assert estimate.input_token_bytes == 4 * expected_tokens
+
+
+@pytest.mark.parametrize("corner", ["hashless", "preamble", "epsilon"])
+def test_weka_input_allowance_covers_native_nonmonotone_main_stream(tmp_path, corner):
+    # These source intervals hide a main-stream request behind an earlier
+    # request with a later recorded end. Native completion frontiers can then
+    # release a different stream while that main-stream request is still live.
+    if corner == "hashless":
+        rows = [(0, 1, 1, 2, [1]), (1, 99, 1, 2, []), (2, 1, 100, 100, [1]), (101, 1, 100, 100, [2])]
+    elif corner == "preamble":
+        rows = [(0, 100, 1, 2, [99]), (1, 1, 100, 100, [1]), (101, 1, 100, 100, [2])]
+    else:
+        rows = [(0, 1, 1, 2, [1]), (0.9999995, 0, 100, 100, [1]), (1.01, 1, 100, 100, [2])]
+    requests = [
+        {**_request(tokens, output, hashes=hashes, timestamp=start), "api_time": duration}
+        for start, duration, tokens, output, hashes in rows
+    ]
+    trace = _write_trace(tmp_path, _play(requests))
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "mode": "aggregated",
+                "model": "example/model",
+                "hardware": "h200_sxm",
+                "context_length": 1024,
+                "workers": {
+                    "aggregated": {
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                        "timing": {"type": "fixed", "prefill_ms": 1100, "decode_ms": 1100},
+                    }
+                },
+            },
+            "traffic": {
+                "source": {"type": "trace", "format": "weka", "paths": [str(trace)]},
+                "load": {"type": "trace_timestamps", "agentic_lanes": 1},
+            },
+        }
+    )
+    result = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            prediction_to_replay_spec(config),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+    observed = result.metadata["native_report"]["per_request"]
+    assert len(observed) == len(requests)
+    peak_live_inputs = max(
+        sum(r["input_length"] for r in observed if r["arrival_time_ms"] <= start < r["terminal_time_ms"])
+        for start in (r["arrival_time_ms"] for r in observed)
+    )
+    assert peak_live_inputs == 200
+    estimate = estimate_workload(workload_bounds(config), stack="engine")
+    assert estimate.input_token_bytes >= 4 * peak_live_inputs
 
 
 def test_weka_header_order_does_not_change_allocations(tmp_path):
